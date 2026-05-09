@@ -758,18 +758,19 @@ function isSidebarPid(pid) {
 // `read -r` captures the line as a literal bash string, and exec our
 // binary with the value already-properly-quoted by bash.
 function promptCommand() {
-  const cmd = `read -rp 'project (name|path): ' __nmux_input && [ -n "$__nmux_input" ] && exec ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
-  // tmux ≥ 3.2 has display-popup; fall back to command-prompt without
-  // template substitution (single arg from -I that the user edits) if the
-  // popup is unavailable.
+  // POSIX-sh compatible read (display-popup -E uses /bin/sh, and dash on
+  // Debian/Ubuntu does NOT support `read -p`). Use printf + read -r.
+  const cmd =
+    `printf 'project (name|path): '; ` +
+    `IFS= read -r __nmux_input || exit 0; ` +
+    `[ -n "$__nmux_input" ] || exit 0; ` +
+    `exec ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
+  // tmux ≥ 3.2 has display-popup. Try it first.
   const popup = spawnSync('tmux', ['display-popup', '-E', cmd], { stdio: 'ignore' });
   if (popup.status === 0) return;
-  // Fallback: tmux without display-popup. Use command-prompt's pre-fill
-  // (-I) and a single tmux command — no chained `;` so input cannot
-  // span command boundaries. The %% is wrapped in single quotes in the
-  // shell command so a `'` in input still produces a parse error inside
-  // tmux (which fails the bind safely, no shell exec). Best we can do
-  // without display-popup.
+  // Fallback for old tmux without display-popup. Single-command template
+  // (no chained `;`) so a quote in user input fails parsing inside tmux
+  // rather than escaping into shell.
   spawnSync('tmux', ['command-prompt', '-1', '-p', 'project (name|path):',
                      `run-shell ${shQuote(`${NMUX_BIN} open '%%'`)}`], { stdio: 'ignore' });
 }
