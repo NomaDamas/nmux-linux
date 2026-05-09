@@ -750,25 +750,28 @@ function isSidebarPid(pid) {
 }
 
 // ---------- prompt + click + kill ----------
-// Quote-safe prompt: stash the user's input in a tmux global env var,
-// then read it back inside nmux-linux instead of interpolating into the
-// command-prompt template — so a quote in the input cannot escape into
-// arbitrary shell.
+// Quote-safe prompt: tmux's command-prompt %% substitution literally
+// inserts user input into the template, then the result is *re-parsed* as
+// tmux commands. A quote / semicolon / double-quote in the input fragments
+// the command boundaries ("too many arguments" or, worse, command injection).
+// We instead use display-popup -E to spawn an interactive shell where
+// `read -r` captures the line as a literal bash string, and exec our
+// binary with the value already-properly-quoted by bash.
 function promptCommand() {
-  const stash = `set-environment -g NMUX_LINUX_PROMPT_INPUT '%%'`;
-  const dispatch = `run-shell ${shQuote(`${NMUX_BIN} open-from-prompt`)}`;
-  spawnSync('tmux', ['command-prompt', '-p', 'project (name|path):',
-                     `${stash} \\; ${dispatch}`], { stdio: 'ignore' });
-}
-function openFromPrompt() {
-  let val = '';
-  try {
-    const out = tmux(['show-environment', '-g', 'NMUX_LINUX_PROMPT_INPUT'], { allowFail: true });
-    val = (out.split('=')[1] || '').trim();
-  } catch {}
-  try { tmux(['set-environment', '-g', '-u', 'NMUX_LINUX_PROMPT_INPUT'], { allowFail: true }); } catch {}
-  if (!val) return;
-  openProject(val);
+  const cmd = `read -rp 'project (name|path): ' __nmux_input && [ -n "$__nmux_input" ] && exec ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
+  // tmux ≥ 3.2 has display-popup; fall back to command-prompt without
+  // template substitution (single arg from -I that the user edits) if the
+  // popup is unavailable.
+  const popup = spawnSync('tmux', ['display-popup', '-E', cmd], { stdio: 'ignore' });
+  if (popup.status === 0) return;
+  // Fallback: tmux without display-popup. Use command-prompt's pre-fill
+  // (-I) and a single tmux command — no chained `;` so input cannot
+  // span command boundaries. The %% is wrapped in single quotes in the
+  // shell command so a `'` in input still produces a parse error inside
+  // tmux (which fails the bind safely, no shell exec). Best we can do
+  // without display-popup.
+  spawnSync('tmux', ['command-prompt', '-1', '-p', 'project (name|path):',
+                     `run-shell ${shQuote(`${NMUX_BIN} open '%%'`)}`], { stdio: 'ignore' });
 }
 
 function confirmKill() {
@@ -969,7 +972,6 @@ function main() {
   if (cmd === 'confirm-kill') { confirmKill(); return; }
   if (cmd === 'click')     { clickHandler(args._[1], args._[2], args._[3]); return; }
   if (cmd === 'prompt')    { promptCommand(); return; }
-  if (cmd === 'open-from-prompt') { openFromPrompt(); return; }
   if (cmd === 'open')      { openProject(args._[1]); return; }
   if (cmd === 'close-window') { closeWindow(args._[1]); return; }
   if (cmd === 'close-current') { closeCurrent(); return; }
