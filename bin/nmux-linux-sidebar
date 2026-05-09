@@ -1,0 +1,238 @@
+#!/usr/bin/env node
+// nmux-linux-sidebar — live project list pane.
+// Sections: open windows (with × close button) → closed registered projects
+// (clickable to reopen) → "+ new project" → "⊗ kill nmux-linux".
+// Writes a clickmap consumed by `nmux-linux click <y> <x>`.
+
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const SESSION = process.env.NMUX_LINUX_SESSION || 'nmux-linux';
+const CONFIG_DIR = path.join(os.homedir(), '.config', 'nmux-linux');
+const CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
+const STATE_PATH = path.join(CONFIG_DIR, 'state.json');
+const CLICKMAP_DIR = path.join(CONFIG_DIR, 'clickmaps');
+// Per-pane clickmap so a click in pane A is never resolved against pane B's
+// stale rows. tmux sets $TMUX_PANE for processes inside a pane.
+const PANE_ID = (process.env.TMUX_PANE || 'default').replace(/[^A-Za-z0-9_%-]/g, '_');
+const CLICKMAP_PATH = path.join(CLICKMAP_DIR, `${PANE_ID}.txt`);
+const SCAN_ROOTS = [path.join(os.homedir(), 'projects')];
+
+// Atomic write helper — same pattern used by the main nmux-linux script.
+function writeAtomic(filePath, content) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, '.' + path.basename(filePath) + '.tmp.' + process.pid + '.' + Date.now());
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, filePath);
+}
+const DISCOVER_LIMIT = 30;
+const DISCOVER_EXCLUDE = new Set([
+  'node_modules', '__pycache__', '.git', '.venv', 'venv', 'dist', 'build',
+  '.cache', '.next', '.nuxt', 'target', 'coverage', '.pytest_cache',
+  'tests', 'static', '.omc', '.omx',
+]);
+
+function t(args) {
+  const r = spawnSync('tmux', args, { encoding: 'utf8' });
+  return r.status === 0 ? (r.stdout || '').trimEnd() : '';
+}
+const SPINNER = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+let __frame = 0;
+
+function icon(s) {
+  if (s === 'done') return '✓';
+  if (s === 'failed') return '✕';
+  if (s === 'need-input') return '?';
+  if (s === 'running') return SPINNER[__frame % SPINNER.length];
+  return ' ';
+}
+
+// Returns ANSI prefix that paints the *entire row* (background block) for
+// "loud" done/failed/need-input states so the user sees them at a glance,
+// and a quieter foreground-only style for running/active/idle.
+function rowStyle(s, active) {
+  if (s === 'done')        return { open: '\x1b[1;30;42m', close: '\x1b[0m', loud: true };  // black on green
+  if (s === 'failed')      return { open: '\x1b[1;97;41m', close: '\x1b[0m', loud: true };  // white on red
+  if (s === 'need-input')  return { open: '\x1b[1;30;43m', close: '\x1b[0m', loud: true };  // black on yellow
+  if (s === 'running')     return { open: '\x1b[1;36m',    close: '\x1b[0m', loud: false }; // bold cyan fg
+  if (active)              return { open: '\x1b[7m',       close: '\x1b[0m', loud: false }; // reverse
+  return { open: '', close: '', loud: false };
+}
+function termWidth() { return process.stdout.columns || 26; }
+function visLen(s) { return s.replace(/\x1b\[[0-9;]*m/g, '').length; }
+function pad(text, w) {
+  const v = visLen(text);
+  if (v > w) {
+    let cut = '', plain = '', i = 0;
+    while (i < text.length && plain.length < w - 1) {
+      if (text[i] === '\x1b') {
+        const m = text.slice(i).match(/^\x1b\[[0-9;]*m/);
+        if (m) { cut += m[0]; i += m[0].length; continue; }
+      }
+      cut += text[i]; plain += text[i]; i++;
+    }
+    return cut + '…';
+  }
+  return text + ' '.repeat(w - v);
+}
+
+function loadRegistry() {
+  try { return (JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')).projects || []); }
+  catch { return []; }
+}
+
+function scanSubfolders() {
+  const found = []; const seen = new Set();
+  for (const root of SCAN_ROOTS) {
+    let entries;
+    try { entries = fs.readdirSync(root); } catch { continue; }
+    for (const name of entries) {
+      if (name.startsWith('.')) continue;
+      if (DISCOVER_EXCLUDE.has(name)) continue;
+      if (seen.has(name)) continue;
+      const dir = path.join(root, name);
+      let st; try { st = fs.statSync(dir); } catch { continue; }
+      if (!st.isDirectory()) continue;
+      seen.add(name);
+      found.push({ name, mtime: st.mtimeMs });
+    }
+  }
+  found.sort((a, b) => b.mtime - a.mtime);
+  return found;
+}
+
+function persistOpen(rows) {
+  const open = rows.map(r => (r.p || r.n || '').replace(/^[✓✕?…! ]+\s*/, '')).filter(Boolean);
+  try {
+    let cur = {};
+    if (fs.existsSync(STATE_PATH)) cur = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    const same = JSON.stringify(cur.open || []) === JSON.stringify(open);
+    if (!same) {
+      cur.open = open;
+      writeAtomic(STATE_PATH, JSON.stringify(cur, null, 2) + '\n');
+    }
+  } catch {}
+}
+
+function render() {
+  const w = termWidth();
+  const fmt = '#{window_index}\t#{window_name}\t#{window_active}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}';
+  const out = t(['list-windows', '-t', SESSION, '-F', fmt]);
+  const rows = out
+    ? out.split('\n').map(l => {
+        const [i, n, a, s, p, m] = l.split('\t');
+        return { i, n, a: a === '1', s, p: p || n, m };
+      })
+    : [];
+  const registry = loadRegistry();
+  const openNames = new Set(rows.map(r => (r.p || r.n).replace(/^[✓✕?…! ]+\s*/, '')));
+  const closed = registry.filter(p => !openNames.has(p.name));
+  const registryNames = new Set(registry.map(p => p.name));
+  const discover = scanSubfolders()
+    .filter(p => !openNames.has(p.name) && !registryNames.has(p.name))
+    .slice(0, DISCOVER_LIMIT);
+
+  let buf = '\x1b[2J\x1b[H';
+  buf += '\x1b[1;38;5;46m nmux-linux\x1b[0m \x1b[2m· projects\x1b[0m\n';
+  buf += '\x1b[2m' + '─'.repeat(Math.min(w - 1, 30)) + '\x1b[0m\n';
+
+  // Each entry: row<TAB>action<TAB>arg<TAB>colMin
+  const map = [];
+  let row = 2;
+  const closeColMin = Math.max(0, w - 3);  // last 3 cols reserved for ×
+
+  // -------- open windows --------
+  for (const r of rows) {
+    const name = (r.p || r.n).replace(/^[✓✕?…! ]+\s*/, '');
+    const style = rowStyle(r.s, r.a);
+    const arrow = r.a ? '▸' : ' ';
+    const idxs = String(r.i).padStart(2);
+    const ic = icon(r.s);
+    if (style.loud) {
+      // Whole-row colored block — name + status + close button all on the
+      // background color. Stays loud until the user visits the window
+      // (after-select-window → nmux-linux clear-status resets it).
+      const inner = `${arrow}${idxs} ${ic} ${name}`;
+      const padded = pad(inner, w - 3);
+      // Render close × in the same row block but with explicit fg/bg
+      // so it stays readable on the colored background.
+      buf += style.open + padded + ' ×' + style.close + '\n';
+    } else {
+      const left = `${style.open}${arrow}${idxs} ${ic} ${name}${style.close}`;
+      const padded = pad(left, w - 3);
+      const closeMark = r.a ? ' \x1b[1;31m×\x1b[0m' : ' \x1b[2;31m×\x1b[0m';
+      buf += padded + closeMark + '\n';
+    }
+    map.push(`${row}\tswitch\t${r.i}\t0`);
+    map.push(`${row}\tclose\t${r.i}\t${closeColMin}`);
+    row++;
+    if (r.m) {
+      const msgLine = ` \x1b[2m${r.m.slice(0, w - 4)}\x1b[0m`;
+      buf += pad(msgLine, w - 1) + '\n';
+      map.push(`${row}\tswitch\t${r.i}\t0`);
+      row++;
+    }
+  }
+
+  // spacer
+  buf += '\n'; row++;
+
+  // -------- closed registered projects (reopen) --------
+  if (closed.length) {
+    buf += pad('\x1b[2m closed (click to reopen)\x1b[0m', w - 1) + '\n';
+    row++;
+    // limit to first 12 to avoid overwhelming sidebar
+    for (const p of closed.slice(0, 20)) {
+      buf += pad(`\x1b[37m   ${p.name}\x1b[0m`, w - 1) + '\n';
+      map.push(`${row}\treopen\t${p.name}\t0`);
+      row++;
+    }
+    buf += '\n'; row++;
+  }
+
+  // -------- discoverable subfolders (not yet a project) --------
+  if (discover.length) {
+    buf += pad('\x1b[2m new (click to start)\x1b[0m', w - 1) + '\n';
+    row++;
+    for (const p of discover) {
+      buf += pad(`\x1b[36m   ${p.name}\x1b[0m`, w - 1) + '\n';
+      map.push(`${row}\treopen\t${p.name}\t0`);
+      row++;
+    }
+    buf += '\n'; row++;
+  }
+
+  // -------- + new project --------
+  buf += pad('\x1b[1;36m + new project\x1b[0m', w - 1) + '\n';
+  map.push(`${row}\tadd\t-\t0`);
+  row++;
+
+  // -------- ⊗ kill nmux-linux --------
+  buf += pad('\x1b[1;31m ⊗ kill nmux-linux\x1b[0m', w - 1) + '\n';
+  map.push(`${row}\tkill\t-\t0`);
+  row++;
+
+  // hints
+  buf += '\n\x1b[2m click row=switch\n × close window\n M-1..9 keys\n prefix C: new\n prefix X: close\x1b[0m\n';
+
+  process.stdout.write(buf);
+  try { writeAtomic(CLICKMAP_PATH, map.join('\n') + '\n'); } catch {}
+  persistOpen(rows);
+}
+
+render();
+// Faster cadence so newly-added projects appear ~immediately and the
+// running spinner animates smoothly.
+const timer = setInterval(() => { __frame = (__frame + 1) % SPINNER.length; render(); }, 200);
+// Allow the nmux-linux command to nudge us for an instant repaint.
+process.on('SIGUSR1', () => render());
+
+// Best-effort cleanup of the per-pane clickmap on exit so stale files
+// don't accumulate in CLICKMAP_DIR.
+function __exitCleanup() { try { fs.unlinkSync(CLICKMAP_PATH); } catch {} }
+process.on('SIGTERM', () => { clearInterval(timer); __exitCleanup(); process.exit(0); });
+process.on('SIGINT',  () => { clearInterval(timer); __exitCleanup(); process.exit(0); });
+process.on('exit',    __exitCleanup);

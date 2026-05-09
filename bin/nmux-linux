@@ -1,0 +1,992 @@
+#!/usr/bin/env node
+// nmux-linux — tmux addon: project sidebar with mouse navigation,
+// per-project window, persistent open-set, agent-finish notifier.
+// Layout per window: sidebar (left) | main shell | right-top / right-bot.
+
+const { spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const HOME = os.homedir();
+const CONFIG_DIR = path.join(HOME, '.config', 'nmux-linux');
+const CONFIG_PATH = path.join(CONFIG_DIR, 'projects.json');
+const STATE_PATH = path.join(CONFIG_DIR, 'state.json');
+const CLICKMAP_DIR = path.join(CONFIG_DIR, 'clickmaps');  // one file per sidebar pane
+const SESSION = 'nmux-linux';
+const SIDEBAR_WIDTH = 26;
+const RIGHT_PERCENT = 50;        // right column = 50% of remaining-after-sidebar
+                                 // → main pane covers sidebar→middle, right column covers middle→edge.
+const SCAN_ROOTS = [path.join(HOME, 'projects'), path.join(HOME, 'projects', 'private')];
+
+// Resolve own install location from argv[1] so a non-default --prefix
+// (e.g. /opt/nmux-linux/bin/nmux-linux) still spawns the right helper.
+function __resolveSelfDir() {
+  try { return path.dirname(fs.realpathSync(process.argv[1])); }
+  catch { return path.join(HOME, '.local', 'bin'); }
+}
+const NMUX_BIN_DIR = __resolveSelfDir();
+const NMUX_BIN = path.join(NMUX_BIN_DIR, 'nmux-linux');
+const SIDEBAR_HELPER = path.join(NMUX_BIN_DIR, 'nmux-linux-sidebar');
+
+// Atomic JSON / text writes. Writes a sibling tmp then renames into place.
+function writeAtomic(filePath, content) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, '.' + path.basename(filePath) + '.tmp.' + process.pid + '.' + Date.now());
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, filePath);
+}
+
+// Shell-quote — single quote, escape embedded single quotes.
+function shQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+
+const HELP = `nmux-linux — tmux addon
+
+Usage:
+  nmux-linux                       launch+attach (default)
+  nmux-linux launch                idem
+  nmux-linux init [--force]        rescan and write ${CONFIG_PATH}
+  nmux-linux apply [--replace]     rebuild session from open-set
+  nmux-linux refresh               reapply bindings/options to a running session
+  nmux-linux refresh-sidebars      respawn sidebar panes to pick up new code
+  nmux-linux status                print session state
+  nmux-linux kill                  kill nmux-linux session (state is auto-saved)
+  nmux-linux click <y> [x]         internal: handle sidebar mouse click
+  nmux-linux prompt                internal: command-prompt to add/open a project
+  nmux-linux confirm-kill          internal: confirm-before kill the nmux-linux session
+  nmux-linux open <name|path>      open project as window (auto-add if path)
+  nmux-linux close-window <idx>    close window by index (saves state)
+  nmux-linux close-current         close current window (saves state)
+  nmux-linux relayout              rebuild current window into sidebar | main | right(top/bot)
+  nmux-linux fix-layout            re-pin sidebar width across windows (called by hooks)
+  nmux-linux disable-omx-hud       patch omx reconcile.js + set NMUX_LINUX_DISABLE_HUD=1
+                             so omx stops auto-spawning the bottom HUD pane
+  nmux-linux save-state            persist current open-windows
+  nmux-linux notify --project N --status done|failed|need-input|running [--message M]
+  nmux-linux notify-current --status ...   resolve project from current TMUX pane
+  nmux-linux add <name> <path>     append project to registry
+  nmux-linux rm <name>             remove project from registry
+`;
+
+// ---------- helpers ----------
+function tmux(args, opts = {}) {
+  const r = spawnSync('tmux', args, { encoding: 'utf8', ...opts });
+  if (r.status !== 0 && !opts.allowFail) {
+    const err = (r.stderr || '').trim() || `exit ${r.status}`;
+    throw new Error(`tmux ${args.join(' ')}: ${err}`);
+  }
+  return (r.stdout || '').trimEnd();
+}
+function tmuxOk(args) {
+  const r = spawnSync('tmux', args, { encoding: 'utf8' });
+  return r.status === 0;
+}
+function which(bin) {
+  const r = spawnSync('which', [bin], { encoding: 'utf8' });
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+function shEsc(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+
+// ---------- config / state ----------
+function ensureConfigDir() { fs.mkdirSync(CONFIG_DIR, { recursive: true }); }
+function loadConfig() {
+  if (!fs.existsSync(CONFIG_PATH)) return null;
+  try { return migrateConfig(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))); }
+  catch (e) { throw new Error(`config parse error: ${e.message}`); }
+}
+function saveConfig(cfg) {
+  ensureConfigDir();
+  writeAtomic(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n');
+}
+function migrateConfig(cfg) {
+  cfg.projects = (cfg.projects || []).map(p => {
+    delete p.panes; delete p.main; delete p.sub; delete p.exec;
+    if (typeof p.notifyOnFinish !== 'boolean') p.notifyOnFinish = true;
+    return p;
+  });
+  cfg.sidebarWidth = Number(cfg.sidebarWidth) || SIDEBAR_WIDTH;
+  delete cfg.progressWidth;
+  cfg.session = cfg.session || SESSION;
+  cfg.statusPosition = cfg.statusPosition || 'top';
+  return cfg;
+}
+
+function loadState() {
+  try { return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')); }
+  catch { return { open: [] }; }
+}
+function saveState(s) {
+  ensureConfigDir();
+  writeAtomic(STATE_PATH, JSON.stringify(s, null, 2) + '\n');
+}
+
+function scanProjects() {
+  const found = []; const seen = new Set();
+  for (const root of SCAN_ROOTS) {
+    if (!fs.existsSync(root)) continue;
+    for (const name of fs.readdirSync(root)) {
+      if (name.startsWith('.')) continue;
+      const dir = path.join(root, name);
+      let st; try { st = fs.statSync(dir); } catch { continue; }
+      if (!st.isDirectory() || !fs.existsSync(path.join(dir, '.git'))) continue;
+      if (seen.has(name)) continue; seen.add(name);
+      found.push({ name, cwd: dir, mtime: st.mtimeMs });
+    }
+  }
+  found.sort((a, b) => b.mtime - a.mtime);
+  return found.map(({ name, cwd }) => ({ name, cwd }));
+}
+function defaultProject(name, cwd) {
+  return { name, cwd, notifyOnFinish: true };
+}
+function initConfig({ force = false } = {}) {
+  ensureConfigDir();
+  if (fs.existsSync(CONFIG_PATH) && !force) return loadConfig();
+  const cfg = {
+    session: SESSION,
+    sidebarWidth: SIDEBAR_WIDTH,
+    statusPosition: 'top',
+    projects: scanProjects().slice(0, 24).map(p => defaultProject(p.name, p.cwd))
+  };
+  saveConfig(cfg);
+  return cfg;
+}
+
+// ---------- session bindings + per-window option scrub ----------
+function sessionExists(name) { return tmuxOk(['has-session', '-t', name]); }
+
+function listWindowIndices(session) {
+  const out = tmux(['list-windows', '-t', session, '-F', '#{window_index}'], { allowFail: true });
+  return out.split('\n').filter(Boolean);
+}
+
+function scrubWindowStatus(session) {
+  // Strip the top window-status "tabs" per window; sidebar replaces them.
+  // Keep pane-border-status='top' so non-sidebar panes can still show their
+  // titles (main = project, right-top, right-bot). The conditional
+  // pane-border-format below renders an empty bar specifically for the
+  // sidebar pane only.
+  const sidebarFmt = ' #[bold]#{?pane_active,#[fg=colour46],#[fg=colour244]}'
+    + '#{?#{==:#{pane_title},nmux-linux-sidebar}, ,#P · #{pane_title}}#[default] ';
+  for (const idx of listWindowIndices(session)) {
+    const target = `${session}:${idx}`;
+    tmux(['set-window-option', '-t', target, 'window-status-format', ' '], { allowFail: true });
+    tmux(['set-window-option', '-t', target, 'window-status-current-format', ' '], { allowFail: true });
+    tmux(['set-window-option', '-t', target, 'window-status-separator', ''], { allowFail: true });
+    tmux(['set-window-option', '-t', target, 'pane-border-status', 'top'], { allowFail: true });
+    tmux(['set-window-option', '-t', target, 'pane-border-format', sidebarFmt], { allowFail: true });
+  }
+}
+
+function applyTmuxLines(lines) {
+  // Apply each line via source-file but isolate failures so a single
+  // bad line doesn't break the whole bindings installation.
+  // Use a private mkdtemp directory so /tmp/nmux-linux-bindings-* is not
+  // a fixed/predictable filename (avoids symlink-attack class on shared hosts).
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nmux-linux-'));
+  const tmpFile = path.join(tmpDir, 'bindings.tmux');
+  try {
+    for (const line of lines) {
+      try {
+        fs.writeFileSync(tmpFile, line + '\n');
+        tmux(['source-file', tmpFile]);
+      } catch (e) {
+        console.error(`[nmux-linux] skip line: ${line}\n  reason: ${(e.message || e).slice(0, 200)}`);
+      }
+    }
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
+    try { fs.rmdirSync(tmpDir); } catch {}
+  }
+}
+
+function installBindings(session) {
+  const lines = [
+    // Session-level
+    `set-option -t ${session} status on`,
+    `set-option -t ${session} status-position top`,
+    `set-option -t ${session} base-index 1`,
+    `set-option -t ${session} mouse on`,
+
+    // Keep per-pane border titles, but hide the one above the sidebar pane.
+    // (Per-window pane-border-format set in scrubWindowStatus.)
+    `set-option -t ${session} pane-border-status top`,
+
+    // Sidebar already labels everything; keep the top bar minimal.
+    `set-option -t ${session} status on`,
+    `set-option -t ${session} status-left ""`,
+    `set-option -t ${session} status-left-length 0`,
+    `set-option -t ${session} status-right "#[fg=colour244]click sidebar · prefix C: new · prefix X: close#[default] "`,
+    `set-option -t ${session} status-right-length 80`,
+    `set-option -t ${session} status-justify left`,
+
+    // Tell omx to skip auto-spawning the HUD pane below — nmux-linux already owns
+    // the pane layout. Requires the matching env-check patch in
+    // ~/.local/lib/node_modules/oh-my-codex/dist/hud/reconcile.js.
+    `set-environment -t ${session} NMUX_LINUX_DISABLE_HUD 1`,
+
+    // Mouse on sidebar pane → nmux-linux click <y> <x>
+    `bind-key -T root MouseDown1Pane if-shell -F "#{&&:#{==:#{session_name},${session}},#{==:#{pane_title},nmux-linux-sidebar}}" "run-shell '${NMUX_BIN} click #{mouse_y} #{mouse_x} #{pane_id}'" "select-pane -t="`,
+
+    // Prefix
+    `bind-key -T prefix C run-shell "${NMUX_BIN} prompt"`,
+    `bind-key -T prefix X run-shell "${NMUX_BIN} close-current"`,
+
+    // Bell-driven notify (safety net for tools that emit \\a on completion).
+    `set-window-option -g monitor-bell on`,
+    `set-hook -g alert-bell "run-shell -b '${NMUX_BIN} notify --project \\"#{@nmuxlinux_project}\\" --status done --message bell >/dev/null 2>&1 || true'"`,
+
+    // Sidebar fix-up: tmux scales panes proportionally on resize/attach,
+    // so the sidebar stretches when a wider client attaches. Pin it back.
+    `set-hook -g client-attached "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g client-resized "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g window-resized "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g after-split-window "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+
+    // Visiting a window clears its bell/done indicator (the ✓ in the sidebar).
+    `set-hook -g after-select-window "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
+    `set-hook -g session-window-changed "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
+  ];
+  applyTmuxLines(lines);
+  scrubWindowStatus(session);
+}
+
+function buildWindow(cfg, project, isFirst) {
+  const cwd = project.cwd;
+  const shell = process.env.SHELL || '/bin/bash';
+
+  if (isFirst) {
+    tmux(['new-session', '-d', '-s', cfg.session, '-n', project.name, '-c', cwd, shell]);
+    installBindings(cfg.session);
+  } else {
+    tmux(['new-window', '-t', cfg.session, '-n', project.name, '-c', cwd, shell]);
+  }
+  const idx = tmux(['display-message', '-p', '-t', cfg.session, '#{window_index}']);
+  const target = `${cfg.session}:${idx}`;
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_project', project.name]);
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'idle']);
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_message', '']);
+  // strip tabs on this window
+  tmux(['set-window-option', '-t', target, 'window-status-format', ' '], { allowFail: true });
+  tmux(['set-window-option', '-t', target, 'window-status-current-format', ' '], { allowFail: true });
+  tmux(['set-window-option', '-t', target, 'window-status-separator', ''], { allowFail: true });
+  tmux(['set-window-option', '-t', target, 'pane-border-status', 'top'], { allowFail: true });
+
+  buildLayout(cfg, target, project, cwd, shell);
+}
+
+function buildLayout(cfg, target, project, cwd, shell) {
+  // Title the active pane (main shell created by new-window/new-session).
+  tmux(['select-pane', '-t', target, '-T', project.name], { allowFail: true });
+
+  // Split LEFT for sidebar (fixed cells).
+  tmux(['split-window', '-t', target, '-b', '-h', '-l', String(cfg.sidebarWidth || SIDEBAR_WIDTH),
+        '-c', cwd,
+        `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', 'nmux-linux-sidebar'], { allowFail: true });
+
+  // Back to main.
+  tmux(['select-pane', '-t', target, '-R'], { allowFail: true });
+
+  // Split main horizontally → right column (33% of remaining width).
+  // Use `-l N%` (modern tmux 3.0+) instead of deprecated `-p N`.
+  tmux(['split-window', '-t', target, '-h', '-l', `${RIGHT_PERCENT}%`,
+        '-c', cwd, shell], { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', 'right-top'], { allowFail: true });
+
+  // Split right column vertically → right-bottom (50% of right column height).
+  tmux(['split-window', '-t', target, '-v', '-l', '50%', '-c', cwd, shell], { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', 'right-bot'], { allowFail: true });
+
+  // Focus main again (right-bot → up to right-top → left to main).
+  tmux(['select-pane', '-t', target, '-U'], { allowFail: true });
+  tmux(['select-pane', '-t', target, '-L'], { allowFail: true });
+}
+
+function relayoutCurrent() {
+  if (!process.env.TMUX) { console.error('not inside tmux'); return; }
+  const info = tmux(['display-message', '-p', '#{session_name}\t#{window_index}\t#{@nmuxlinux_project}\t#{pane_current_path}'], { allowFail: true });
+  const [s, idx, projName, pcwd] = info.split('\t');
+  if (s !== SESSION) { console.error('not in nmux-linux session'); return; }
+  const target = `${SESSION}:${idx}`;
+  const cfg = loadConfig() || initConfig();
+  const cwd = (cfg.projects.find(p => p.name === projName) || {}).cwd || pcwd;
+  const shell = process.env.SHELL || '/bin/bash';
+  // Find the main pane (any pane that's NOT the nmux-linux-sidebar). Prefer one with title === projName.
+  const panesOut = tmux(['list-panes', '-t', target, '-F', '#{pane_id}\t#{pane_title}\t#{pane_pid}'], { allowFail: true });
+  const all = panesOut.split('\n').filter(Boolean).map(l => {
+    const [pid, title, ppid] = l.split('\t');
+    return { pid, title, ppid, isSidebar: title === 'nmux-linux-sidebar' || isSidebarPid(ppid) };
+  });
+  const sidebar = all.find(p => p.isSidebar);
+  const candidates = all.filter(p => !p.isSidebar);
+  const main = candidates.find(p => p.title === projName) || candidates[0];
+  if (!main) { console.error('no main pane found'); return; }
+  // Kill every pane except sidebar and main.
+  for (const p of candidates) {
+    if (p.pid === main.pid) continue;
+    tmux(['kill-pane', '-t', p.pid], { allowFail: true });
+  }
+  if (!sidebar) {
+    // Recreate sidebar on the LEFT
+    tmux(['split-window', '-t', main.pid, '-b', '-h', '-l', String(cfg.sidebarWidth || SIDEBAR_WIDTH),
+          '-c', cwd,
+          `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
+    tmux(['select-pane', '-t', target, '-T', 'nmux-linux-sidebar'], { allowFail: true });
+    tmux(['select-pane', '-t', main.pid], { allowFail: true });
+  } else {
+    // Resize sidebar back to configured width.
+    tmux(['resize-pane', '-t', sidebar.pid, '-x', String(cfg.sidebarWidth || SIDEBAR_WIDTH)], { allowFail: true });
+  }
+  // Now main is alone (right of sidebar). Add right column with 2 stacked panes.
+  tmux(['select-pane', '-t', main.pid], { allowFail: true });
+  tmux(['split-window', '-t', main.pid, '-h', '-l', `${RIGHT_PERCENT}%`, '-c', cwd, shell], { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', 'right-top'], { allowFail: true });
+  tmux(['split-window', '-t', target, '-v', '-l', '50%', '-c', cwd, shell], { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', 'right-bot'], { allowFail: true });
+  tmux(['select-pane', '-t', main.pid], { allowFail: true });
+  console.log('relayout done');
+}
+
+function applySession({ replace = false } = {}) {
+  let cfg = loadConfig() || initConfig();
+  let state = loadState();
+  if (sessionExists(cfg.session)) {
+    if (!replace) { installBindings(cfg.session); return cfg; }
+    captureAndSaveOpen(cfg.session);
+    state = loadState();
+    tmux(['kill-session', '-t', cfg.session]);
+  }
+  const known = new Map(cfg.projects.map(p => [p.name, p]));
+  let toOpen = (state.open || []).filter(n => known.has(n)).map(n => known.get(n));
+  if (!toOpen.length) toOpen = cfg.projects.slice(0, 1);
+  if (!toOpen.length) throw new Error('no projects to open. Run `nmux-linux init` or `nmux-linux add <name> <path>`.');
+  toOpen.forEach((p, i) => buildWindow(cfg, p, i === 0));
+  // base-index can only take effect for FUTURE new-window calls, so the
+  // initial new-session created window 0 even though our session-level
+  // base-index is 1. Renumber once everything's built.
+  tmux(['move-window', '-r', '-s', cfg.session], { allowFail: true });
+  const firstIdx = (tmux(['list-windows', '-t', cfg.session, '-F', '#{window_index}'], { allowFail: true })
+    .split('\n')[0] || '1').trim() || '1';
+  tmux(['select-window', '-t', `${cfg.session}:${firstIdx}`], { allowFail: true });
+  saveState({ open: toOpen.map(p => p.name) });
+  return cfg;
+}
+
+function captureAndSaveOpen(session) {
+  if (!sessionExists(session)) return;
+  const out = tmux(['list-windows', '-t', session, '-F',
+    '#{@nmuxlinux_project}\t#{window_name}'], { allowFail: true });
+  const open = [];
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [proj, name] = line.split('\t');
+    const key = proj || (name || '').replace(/^[✓✕?…! ]+\s*/, '');
+    if (key) open.push(key);
+  }
+  const cur = loadState();
+  saveState({ ...cur, open });
+}
+
+function attach(session) {
+  if (process.env.TMUX) {
+    spawnSync('tmux', ['switch-client', '-t', session], { stdio: 'inherit' });
+  } else {
+    spawnSync('tmux', ['attach-session', '-t', session], { stdio: 'inherit' });
+  }
+}
+
+// ---------- live ops ----------
+function userMsg(text, dur = 2500) {
+  spawnSync('tmux', ['display-message', '-d', String(dur), '-t', SESSION, String(text)], { stdio: 'ignore' });
+}
+
+function findInRegistryOrPath(arg) {
+  let cfg = loadConfig() || initConfig();
+  let proj = cfg.projects.find(p => p.name === arg);
+  if (proj) return { cfg, proj, registered: true };
+
+  let cwd = null;
+  if (path.isAbsolute(arg) && fs.existsSync(arg)) cwd = arg;
+  if (!cwd) for (const root of SCAN_ROOTS) {
+    const c = path.join(root, arg);
+    if (fs.existsSync(c)) { cwd = c; break; }
+  }
+  if (!cwd) {
+    const r = path.resolve(arg);
+    if (fs.existsSync(r)) cwd = r;
+  }
+
+  // Nothing exists yet — auto-create the directory so "new project" really
+  // creates one. Bare names land under ~/projects/<name>; slashed args are
+  // taken as relative or absolute paths.
+  if (!cwd) {
+    let newCwd;
+    if (path.isAbsolute(arg)) newCwd = arg;
+    else if (arg.includes('/')) newCwd = path.resolve(arg);
+    else newCwd = path.join(SCAN_ROOTS[0], arg);
+    try { fs.mkdirSync(newCwd, { recursive: true }); }
+    catch (e) { throw new Error(`mkdir ${newCwd}: ${e.message}`); }
+    cwd = newCwd;
+  }
+
+  const name = (path.basename(cwd) || arg).replace(/[:.\s]/g, '-').slice(0, 40);
+  proj = cfg.projects.find(p => p.name === name);
+  if (!proj) {
+    proj = defaultProject(name, cwd);
+    cfg.projects.unshift(proj);
+    saveConfig(cfg);
+  }
+  return { cfg, proj, registered: false };
+}
+
+function nudgeSidebars() {
+  // SIGUSR1 every nmux-linux-sidebar process so they repaint immediately.
+  try {
+    for (const child of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(child)) continue;
+      try {
+        const cmd = fs.readFileSync(`/proc/${child}/cmdline`, 'utf8');
+        if (cmd.includes('nmux-linux-sidebar')) process.kill(parseInt(child, 10), 'SIGUSR1');
+      } catch {}
+    }
+  } catch {}
+}
+
+function openProject(arg) {
+  if (!arg) throw new Error('usage: nmux-linux open <name|path>');
+  let cfg, proj;
+  try {
+    ({ cfg, proj } = findInRegistryOrPath(arg));
+  } catch (e) {
+    userMsg(`nmux-linux: ${e.message}`, 4000);
+    throw e;
+  }
+  if (!sessionExists(cfg.session)) {
+    saveState({ ...loadState(), open: [proj.name] });
+    applySession();
+    attach(cfg.session);
+    return;
+  }
+  const out = tmux(['list-windows', '-t', cfg.session, '-F', '#{@nmuxlinux_project}\t#{window_index}'], { allowFail: true });
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [n, idx] = line.split('\t');
+    if (n === proj.name) {
+      tmux(['select-window', '-t', `${cfg.session}:${idx}`]);
+      nudgeSidebars();
+      userMsg(`nmux-linux: switched to ${proj.name}`);
+      return;
+    }
+  }
+  buildWindow(cfg, proj, false);
+  captureAndSaveOpen(cfg.session);
+  nudgeSidebars();
+  userMsg(`nmux-linux: opened ${proj.name} (${proj.cwd})`, 3500);
+}
+
+function closeWindow(idx) {
+  if (!idx) return;
+  if (!sessionExists(SESSION)) return;
+  tmux(['kill-window', '-t', `${SESSION}:${idx}`], { allowFail: true });
+  setTimeout(() => captureAndSaveOpen(SESSION), 50);
+}
+function closeCurrent() {
+  if (!process.env.TMUX) { console.error('not inside tmux'); return; }
+  const info = tmux(['display-message', '-p', '#{session_name}\t#{window_index}'], { allowFail: true });
+  const [s, idx] = info.split('\t');
+  if (s !== SESSION) return;
+  closeWindow(idx);
+}
+
+function killOmxHudPanes() {
+  // Identify panes whose process tree runs `omx hud --watch` and kill them.
+  if (!sessionExists(SESSION)) return 0;
+  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F', '#{pane_id}\t#{pane_pid}'], { allowFail: true });
+  let killed = 0;
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [pid, ppid] = line.split('\t');
+    if (paneIsOmxHud(ppid)) {
+      tmux(['kill-pane', '-t', pid], { allowFail: true });
+      killed++;
+    }
+  }
+  return killed;
+}
+
+function paneIsOmxHud(rootPid) {
+  if (!rootPid) return false;
+  const stack = [String(rootPid)];
+  while (stack.length) {
+    const p = stack.pop();
+    try {
+      const cmd = fs.readFileSync(`/proc/${p}/cmdline`, 'utf8');
+      if (/omx[^/]*\bhud\b/.test(cmd) || cmd.includes('hud --watch')) return true;
+    } catch {}
+    try {
+      // breadth via reading children — best-effort
+      const procs = fs.readdirSync('/proc');
+      for (const child of procs) {
+        if (!/^\d+$/.test(child)) continue;
+        try {
+          const stat = fs.readFileSync(`/proc/${child}/stat`, 'utf8');
+          const ppid = stat.split(') ').pop().split(' ')[1];
+          if (String(ppid) === p) stack.push(child);
+        } catch {}
+      }
+    } catch {}
+  }
+  return false;
+}
+
+const HUD_DISABLE_MARKER = path.join(CONFIG_DIR, 'disable-hud-omx');
+
+function resolveOmxHudPaths() {
+  const candidates = [];
+  try {
+    const omxBin = spawnSync('which', ['omx'], { encoding: 'utf8' }).stdout.trim();
+    if (omxBin) {
+      const real = fs.realpathSync(omxBin);
+      const pkgRoot = path.resolve(path.dirname(real), '..', '..', 'lib', 'node_modules', 'oh-my-codex');
+      candidates.push(pkgRoot);
+      candidates.push(path.resolve(path.dirname(real), '..', 'lib', 'node_modules', 'oh-my-codex'));
+    }
+  } catch {}
+  try {
+    const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf8' }).stdout.trim();
+    if (npmRoot) candidates.push(path.join(npmRoot, 'oh-my-codex'));
+  } catch {}
+  for (const home of [os.homedir(), '/usr/local', '/usr']) {
+    candidates.push(path.join(home, '.local', 'lib', 'node_modules', 'oh-my-codex'));
+    candidates.push(path.join(home, 'lib', 'node_modules', 'oh-my-codex'));
+  }
+  for (const root of candidates) {
+    const reconcile = path.join(root, 'dist', 'hud', 'reconcile.js');
+    const hud = path.join(root, 'dist', 'hud', 'tmux.js');
+    if (fs.existsSync(reconcile) && fs.existsSync(hud)) {
+      return { reconcile, hud, root };
+    }
+  }
+  return null;
+}
+
+function patchOmxReconcile() {
+  const paths = resolveOmxHudPaths();
+  if (!paths) {
+    console.error('[nmux-linux] omx (oh-my-codex) not found — skipping omx HUD opt-out patch');
+    console.error('[nmux-linux] (the marker file still suppresses HUD if omx is installed later)');
+    return false;
+  }
+  const ok1 = patchReconcileFile(paths.reconcile);
+  const ok2 = patchHudTmuxFile(paths.hud);
+  return ok1 && ok2;
+}
+
+function patchReconcileFile(reconcilePath) {
+  if (!fs.existsSync(reconcilePath)) {
+    console.error(`[nmux-linux] reconcile.js not found at ${reconcilePath}`);
+    return false;
+  }
+  let src = fs.readFileSync(reconcilePath, 'utf8');
+  if (src.includes('__nmuxlinux_marker') && src.includes('__nmuxlinux_existsSync')) return true;
+
+  if (!src.includes('__nmuxlinux_existsSync')) {
+    const importAnchor = `import { resolveOmxCliEntryPath } from '../utils/paths.js';`;
+    if (!src.includes(importAnchor)) { console.error('[nmux-linux] reconcile.js imports unexpected'); return false; }
+    src = src.replace(importAnchor, importAnchor +
+      `\nimport { existsSync as __nmuxlinux_existsSync } from 'fs';` +
+      `\nimport { homedir as __nmuxlinux_homedir } from 'os';` +
+      `\nimport { join as __nmuxlinux_join } from 'path';`);
+  }
+  const insertAfter = `if (!env.TMUX) {
+        return {
+            status: 'skipped_not_tmux',
+            paneId: null,
+            desiredHeight: null,
+            duplicateCount: 0,
+        };
+    }`;
+  if (!src.includes(insertAfter)) { console.error('[nmux-linux] reconcile.js shape unexpected'); return false; }
+  const inject = `
+    try {
+        const __nmuxlinux_marker = __nmuxlinux_join(__nmuxlinux_homedir(), '.config', 'nmux-linux', 'disable-hud-omx');
+        if (env.NMUX_LINUX_DISABLE_HUD === '1' || env.OMX_HUD_DISABLE === '1' || __nmuxlinux_existsSync(__nmuxlinux_marker)) {
+            return {
+                status: 'skipped_disabled',
+                paneId: null,
+                desiredHeight: null,
+                duplicateCount: 0,
+            };
+        }
+    } catch (_) { /* ignore */ }`;
+  src = src.replace(insertAfter, insertAfter + inject);
+  fs.writeFileSync(reconcilePath, src);
+  console.log(`[nmux-linux] patched ${reconcilePath}`);
+  return true;
+}
+
+function patchHudTmuxFile(hudPath) {
+  if (!fs.existsSync(hudPath)) {
+    console.error(`[nmux-linux] hud/tmux.js not found at ${hudPath}`);
+    return false;
+  }
+  let src = fs.readFileSync(hudPath, 'utf8');
+  if (src.includes('__nmuxlinux_hudSuppressed')) return true;
+
+  const importAnchor = `import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';`;
+  if (!src.includes(importAnchor)) { console.error('[nmux-linux] hud/tmux.js imports unexpected'); return false; }
+  src = src.replace(importAnchor, importAnchor +
+    `\nimport { existsSync as __nmuxlinux_existsSync } from 'fs';` +
+    `\nimport { homedir as __nmuxlinux_homedir } from 'os';` +
+    `\nimport { join as __nmuxlinux_join } from 'path';` +
+    `\nfunction __nmuxlinux_hudSuppressed() {` +
+    `\n    try {` +
+    `\n        if (process.env.NMUX_LINUX_DISABLE_HUD === '1' || process.env.OMX_HUD_DISABLE === '1') return true;` +
+    `\n        return __nmuxlinux_existsSync(__nmuxlinux_join(__nmuxlinux_homedir(), '.config', 'nmux-linux', 'disable-hud-omx'));` +
+    `\n    } catch (_) { return false; }` +
+    `\n}`);
+
+  const fnAnchor = `export function createHudWatchPane(cwd, hudCmd, options = {}, execTmuxSync = defaultExecTmuxSync) {`;
+  if (!src.includes(fnAnchor)) { console.error('[nmux-linux] createHudWatchPane signature changed'); return false; }
+  src = src.replace(fnAnchor, fnAnchor +
+    `\n    if (__nmuxlinux_hudSuppressed()) return null;`);
+
+  fs.writeFileSync(hudPath, src);
+  console.log(`[nmux-linux] patched ${hudPath}`);
+  return true;
+}
+
+function disableOmxHud() {
+  const ok = patchOmxReconcile();
+  // Marker file works for *all* shell processes (including ones started before
+  // we set the tmux session env), since reconcile.js just stat()s it on every
+  // prompt. Even if the source patch failed, an installed marker still has
+  // value when omx is later patched/installed, but we surface failure clearly.
+  ensureConfigDir();
+  writeAtomic(HUD_DISABLE_MARKER, 'nmux-linux: HUD reconcile suppressed\n');
+  if (!ok) {
+    console.error('[nmux-linux] WARN: omx source patch failed — marker is in place but');
+    console.error('  omx will only honor it on a build that has been patched. Run');
+    console.error('  `nmux-linux disable-omx-hud` again after omx upgrade/reinstall.');
+    process.exitCode = 1;
+  }
+  console.log(`[nmux-linux] marker written: ${HUD_DISABLE_MARKER}`);
+
+  if (sessionExists(SESSION)) {
+    tmux(['set-environment', '-t', SESSION, 'NMUX_LINUX_DISABLE_HUD', '1'], { allowFail: true });
+    const killed = killOmxHudPanes();
+    console.log(`[nmux-linux] NMUX_LINUX_DISABLE_HUD=1 set on session; ${killed} stale HUD pane(s) killed.`);
+  }
+}
+
+function enableOmxHud() {
+  // Reverse switch: remove marker + unset env. Patched reconcile stays;
+  // it's harmless when no marker/env is present.
+  try { fs.unlinkSync(HUD_DISABLE_MARKER); console.log(`[nmux-linux] marker removed`); } catch {}
+  if (sessionExists(SESSION)) {
+    tmux(['set-environment', '-t', SESSION, '-u', 'NMUX_LINUX_DISABLE_HUD'], { allowFail: true });
+  }
+}
+
+function fixLayout() {
+  // tmux scales panes proportionally on resize; pin sidebar back to its
+  // configured cell-width across all nmux-linux windows. Also ensures right
+  // column halves the post-sidebar area so main is sidebar→middle.
+  if (!sessionExists(SESSION)) return;
+  const cfg = loadConfig() || initConfig();
+  const sw = Number(cfg.sidebarWidth) || SIDEBAR_WIDTH;
+  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
+    '#{window_id}\t#{pane_id}\t#{pane_title}\t#{pane_pid}\t#{pane_left} #{pane_top}'],
+    { allowFail: true });
+  const byWin = new Map();
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [wid, pid, title, ppid, leftTop] = line.split('\t');
+    const isSidebar = title === 'nmux-linux-sidebar' || isSidebarPid(ppid);
+    if (!byWin.has(wid)) byWin.set(wid, []);
+    byWin.get(wid).push({ pid, title, isSidebar, leftTop });
+  }
+  for (const [wid, panes] of byWin) {
+    const sidebar = panes.find(p => p.isSidebar);
+    if (sidebar) tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
+  }
+}
+
+function refreshSidebars() {
+  if (!sessionExists(SESSION)) return;
+  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F', '#{pane_id}\t#{pane_pid}\t#{pane_title}'], { allowFail: true });
+  let hits = 0;
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [pid, ppid, title] = line.split('\t');
+    const match = title === 'nmux-linux-sidebar' || isSidebarPid(ppid);
+    if (!match) continue;
+    hits++;
+    tmux(['respawn-pane', '-k', '-t', pid,
+          `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${SESSION} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
+    tmux(['select-pane', '-t', pid, '-T', 'nmux-linux-sidebar'], { allowFail: true });
+  }
+  console.log(`refreshed ${hits} sidebar pane(s)`);
+}
+function isSidebarPid(pid) {
+  if (!pid) return false;
+  try {
+    const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+    if (cmd.includes('nmux-linux-sidebar')) return true;
+    for (const child of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(child)) continue;
+      try {
+        const stat = fs.readFileSync(`/proc/${child}/stat`, 'utf8');
+        const ppid = stat.split(') ').pop().split(' ')[1];
+        if (String(ppid) !== String(pid)) continue;
+        const ccmd = fs.readFileSync(`/proc/${child}/cmdline`, 'utf8');
+        if (ccmd.includes('nmux-linux-sidebar')) return true;
+      } catch {}
+    }
+  } catch {}
+  return false;
+}
+
+// ---------- prompt + click + kill ----------
+// Quote-safe prompt: stash the user's input in a tmux global env var,
+// then read it back inside nmux-linux instead of interpolating into the
+// command-prompt template — so a quote in the input cannot escape into
+// arbitrary shell.
+function promptCommand() {
+  const stash = `set-environment -g NMUX_LINUX_PROMPT_INPUT '%%'`;
+  const dispatch = `run-shell ${shQuote(`${NMUX_BIN} open-from-prompt`)}`;
+  spawnSync('tmux', ['command-prompt', '-p', 'project (name|path):',
+                     `${stash} \\; ${dispatch}`], { stdio: 'ignore' });
+}
+function openFromPrompt() {
+  let val = '';
+  try {
+    const out = tmux(['show-environment', '-g', 'NMUX_LINUX_PROMPT_INPUT'], { allowFail: true });
+    val = (out.split('=')[1] || '').trim();
+  } catch {}
+  try { tmux(['set-environment', '-g', '-u', 'NMUX_LINUX_PROMPT_INPUT'], { allowFail: true }); } catch {}
+  if (!val) return;
+  openProject(val);
+}
+
+function confirmKill() {
+  // tmux confirm-before runs the command on 'y' confirmation.
+  spawnSync('tmux', ['confirm-before', '-p', 'kill nmux-linux session? (y/n) ',
+    `run-shell ${shQuote(`${NMUX_BIN} kill`)}`], { stdio: 'ignore' });
+}
+
+function clickmapPathFor(paneId) {
+  return path.join(CLICKMAP_DIR, `${paneId || 'default'}.txt`);
+}
+
+function clickHandler(rowStr, colStr, paneId) {
+  const row = parseInt(rowStr, 10);
+  const col = parseInt(colStr, 10) || 0;
+  if (!Number.isFinite(row)) return;
+  // Per-pane clickmap so a click in pane A is never resolved against
+  // pane B's stale rows. tmux passes #{pane_id} into the binding.
+  const cmFile = clickmapPathFor(paneId);
+  if (!fs.existsSync(cmFile)) return;
+  const lines = fs.readFileSync(cmFile, 'utf8').split('\n');
+  // Each entry: row<TAB>action<TAB>arg<TAB>colMin
+  // Pick the entry with the highest colMin <= col on the matching row.
+  let best = null;
+  for (const line of lines) {
+    if (!line) continue;
+    const parts = line.split('\t');
+    const r = parseInt(parts[0], 10);
+    if (r !== row) continue;
+    const colMin = parseInt(parts[3] || '0', 10);
+    if (col < colMin) continue;
+    if (!best || colMin > best.colMin) best = { action: parts[1], arg: parts[2] || '', colMin };
+  }
+  if (!best) return;
+  switch (best.action) {
+    case 'switch':
+      if (process.env.TMUX) tmux(['select-window', '-t', `${SESSION}:${best.arg}`], { allowFail: true });
+      else spawnSync('tmux', ['switch-client', '-t', `${SESSION}:${best.arg}`], { stdio: 'ignore' });
+      break;
+    case 'close':
+      closeWindow(best.arg);
+      break;
+    case 'reopen':
+      try { openProject(best.arg); } catch (e) { console.error(e.message); }
+      break;
+    case 'add':
+      promptCommand();
+      break;
+    case 'kill':
+      confirmKill();
+      break;
+  }
+}
+
+// ---------- notify ----------
+function findWindowForProject(session, project) {
+  const out = tmux(['list-windows', '-t', session, '-F',
+    '#{window_index}\t#{window_name}\t#{@nmuxlinux_project}'], { allowFail: true });
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [idx, name, proj] = line.split('\t');
+    const cleanName = (name || '').replace(/^[✓✕?…! ]+\s*/, '');
+    if (proj === project || cleanName === project || name === project) return `${session}:${idx}`;
+  }
+  return null;
+}
+
+function notify({ project, status, message = '', session = SESSION }) {
+  if (!project) throw new Error('--project required');
+  status = String(status || 'done');
+  if (sessionExists(session)) {
+    const target = findWindowForProject(session, project);
+    if (target) {
+      tmux(['set-window-option', '-t', target, '@nmuxlinux_status', status]);
+      tmux(['set-window-option', '-t', target, '@nmuxlinux_message', String(message).slice(0, 120)]);
+    }
+  }
+  fireDesktop(project, status, message);
+  return { project, status, message, session };
+}
+
+function fireDesktop(project, status, message) {
+  try {
+    if (which('notify-send')) {
+      const urgency = status === 'failed' ? 'critical' : status === 'need-input' ? 'normal' : 'low';
+      const icon = status === 'failed' ? 'dialog-error'
+                  : status === 'need-input' ? 'dialog-question'
+                  : 'dialog-information';
+      const env = { ...process.env };
+      if (!env.DBUS_SESSION_BUS_ADDRESS && fs.existsSync(`/run/user/${process.getuid()}/bus`)) {
+        env.DBUS_SESSION_BUS_ADDRESS = `unix:path=/run/user/${process.getuid()}/bus`;
+      }
+      spawnSync('notify-send', ['-u', urgency, '-i', icon,
+        `[nmux-linux] ${project} — ${status}`, message || ''], { env });
+    }
+  } catch {}
+  try {
+    const ok = ['/usr/share/sounds/freedesktop/stereo/complete.oga',
+                '/usr/share/sounds/freedesktop/stereo/bell.oga'];
+    const bad = ['/usr/share/sounds/freedesktop/stereo/dialog-error.oga'];
+    const file = (status === 'failed' ? bad : ok).find(fs.existsSync);
+    if (file && which('paplay')) spawnSync('paplay', [file], { stdio: 'ignore', detached: true });
+  } catch {}
+}
+
+function clearStatus(project) {
+  if (!project) return;
+  if (!sessionExists(SESSION)) return;
+  const target = findWindowForProject(SESSION, project);
+  if (!target) return;
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'idle'], { allowFail: true });
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_message', ''], { allowFail: true });
+}
+
+function notifyCurrent(opts) {
+  let project = opts.project, session = opts.session || SESSION;
+  if (!project && process.env.TMUX) {
+    try {
+      const info = tmux(['display-message', '-p', '#{session_name}\t#{@nmuxlinux_project}\t#{window_name}']);
+      const [s, proj, win] = info.split('\t');
+      session = s || session;
+      project = proj || (win || '').replace(/^[✓✕?…! ]+\s*/, '');
+    } catch {}
+  }
+  if (!project) project = 'unknown';
+  return notify({ ...opts, project, session });
+}
+
+// ---------- ops ----------
+function status() {
+  if (!sessionExists(SESSION)) { console.log('nmux-linux session: (not running)'); return; }
+  const out = tmux(['list-windows', '-t', SESSION, '-F',
+    '#{window_index}\t#{window_name}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}']);
+  console.log(`nmux-linux session: ${SESSION}`);
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [idx, name, st, proj, msg] = line.split('\t');
+    console.log(`  ${idx}. [${st || 'idle'}] ${proj || name}${msg ? ' — ' + msg : ''}`);
+  }
+  const state = loadState();
+  console.log(`open-set persisted: ${(state.open || []).join(', ') || '(none)'}`);
+}
+
+function killSession() {
+  if (sessionExists(SESSION)) {
+    captureAndSaveOpen(SESSION);
+    tmux(['kill-session', '-t', SESSION]);
+  }
+}
+function addProject(name, dir) {
+  if (!name || !dir) throw new Error('usage: nmux-linux add <name> <path>');
+  const abs = path.resolve(dir);
+  if (!fs.existsSync(abs)) throw new Error(`not found: ${abs}`);
+  let cfg = loadConfig() || initConfig();
+  if (cfg.projects.find(p => p.name === name)) throw new Error(`already exists: ${name}`);
+  cfg.projects.push(defaultProject(name, abs));
+  saveConfig(cfg);
+  console.log(`added: ${name} -> ${abs}`);
+}
+function rmProject(name) {
+  let cfg = loadConfig();
+  if (!cfg) throw new Error('no config');
+  const before = cfg.projects.length;
+  cfg.projects = cfg.projects.filter(p => p.name !== name);
+  if (cfg.projects.length === before) throw new Error(`not found: ${name}`);
+  saveConfig(cfg);
+  const st = loadState();
+  st.open = (st.open || []).filter(n => n !== name);
+  saveState(st);
+  console.log(`removed: ${name}`);
+}
+
+// ---------- args ----------
+function parseArgs(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) { out._.push(a); continue; }
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    if (next === undefined || next.startsWith('--')) { out[key] = true; }
+    else { out[key] = next; i++; }
+  }
+  return out;
+}
+
+function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const cmd = args._[0] || 'launch';
+  if (cmd === 'help' || args.help) { console.log(HELP); return; }
+  if (cmd === 'init')      { const cfg = initConfig({ force: args.force }); console.log(`config: ${CONFIG_PATH} (${cfg.projects.length} projects)`); return; }
+  if (cmd === 'apply')     { applySession({ replace: Boolean(args.replace) }); console.log(`session ${SESSION} ready`); return; }
+  if (cmd === 'launch')    { if (!fs.existsSync(CONFIG_PATH)) initConfig(); applySession({ replace: false }); attach(SESSION); return; }
+  if (cmd === 'refresh')   { if (sessionExists(SESSION)) installBindings(SESSION); console.log('bindings reapplied'); return; }
+  if (cmd === 'refresh-sidebars') { refreshSidebars(); return; }
+  if (cmd === 'status')    { status(); return; }
+  if (cmd === 'kill')      { killSession(); console.log('killed'); return; }
+  if (cmd === 'confirm-kill') { confirmKill(); return; }
+  if (cmd === 'click')     { clickHandler(args._[1], args._[2], args._[3]); return; }
+  if (cmd === 'prompt')    { promptCommand(); return; }
+  if (cmd === 'open-from-prompt') { openFromPrompt(); return; }
+  if (cmd === 'open')      { openProject(args._[1]); return; }
+  if (cmd === 'close-window') { closeWindow(args._[1]); return; }
+  if (cmd === 'close-current') { closeCurrent(); return; }
+  if (cmd === 'relayout-current' || cmd === 'relayout') { relayoutCurrent(); return; }
+  if (cmd === 'fix-layout') { fixLayout(); return; }
+  if (cmd === 'disable-omx-hud') { disableOmxHud(); return; }
+  if (cmd === 'enable-omx-hud') { enableOmxHud(); return; }
+  if (cmd === 'save-state'){ captureAndSaveOpen(SESSION); console.log('state saved'); return; }
+  if (cmd === 'notify')    { const r = notify({ project: args.project, status: args.status, message: args.message, session: args.session }); console.log(`${r.project}: ${r.status}`); return; }
+  if (cmd === 'notify-current') { const r = notifyCurrent({ status: args.status, message: args.message, session: args.session, project: args.project }); console.log(`${r.project}: ${r.status}`); return; }
+  if (cmd === 'clear-status') { clearStatus(args.project); return; }
+  if (cmd === 'add')       { addProject(args._[1], args._[2]); return; }
+  if (cmd === 'rm')        { rmProject(args._[1]); return; }
+  console.error('Unknown command: ' + cmd);
+  console.error(HELP);
+  process.exit(2);
+}
+
+try { main(); }
+catch (e) { console.error('[nmux-linux] ' + (e.message || e)); process.exit(1); }
