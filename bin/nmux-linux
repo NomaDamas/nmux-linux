@@ -252,17 +252,33 @@ function installBindings(session) {
   scrubWindowStatus(session);
 }
 
+function nextWindowIndex(session) {
+  const out = tmux(['list-windows', '-t', session, '-F', '#{window_index}'], { allowFail: true });
+  const idxs = out.split('\n').map(s => parseInt(s, 10)).filter(Number.isFinite);
+  return idxs.length ? Math.max(...idxs) + 1 : 1;
+}
+
 function buildWindow(cfg, project, isFirst) {
   const cwd = project.cwd;
   const shell = process.env.SHELL || '/bin/bash';
 
+  let idx;
   if (isFirst) {
     tmux(['new-session', '-d', '-s', cfg.session, '-n', project.name, '-c', cwd, shell]);
     installBindings(cfg.session);
+    // The session has exactly one window now — read its index back instead
+    // of trusting display-message, which under `-t SESSION` (no window
+    // specifier) resolves to whatever tmux considers the first matching
+    // window of the session. After the post-build move-window -r in
+    // applySession this becomes the canonical first window.
+    const wins = tmux(['list-windows', '-t', cfg.session, '-F', '#{window_index}'], { allowFail: true });
+    idx = (wins.split('\n')[0] || '1').trim() || '1';
   } else {
-    tmux(['new-window', '-t', cfg.session, '-n', project.name, '-c', cwd, shell]);
+    // Pin the index explicitly so `set-window-option -t SESSION:idx ...`
+    // for the brand-new window can never collide with an existing one.
+    idx = String(nextWindowIndex(cfg.session));
+    tmux(['new-window', '-t', `${cfg.session}:${idx}`, '-n', project.name, '-c', cwd, shell]);
   }
-  const idx = tmux(['display-message', '-p', '-t', cfg.session, '#{window_index}']);
   const target = `${cfg.session}:${idx}`;
   tmux(['set-window-option', '-t', target, '@nmuxlinux_project', project.name]);
   tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'idle']);
