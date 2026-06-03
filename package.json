@@ -11,6 +11,7 @@
     "bin/",
     "share/",
     "doc/",
+    "assets/",
     "install.sh",
     "uninstall.sh",
     "README.md",
