@@ -1617,6 +1617,49 @@ const CODEX_SESSIONS_DIR = path.join(HOME, '.codex', 'sessions');
 const CODEX_ROLLOUT_AGE_MS = 24 * 3600 * 1000; // ignore rollouts older than a day
 const _codexRolloutCache = new Map(); // path → { size, plan, plannedAt }
 
+const _codexCandidateCache = { at: 0, candidates: [] };
+const CODEX_CANDIDATE_SCAN_TTL_MS = 30000;
+
+function codexDateDirParts(d) {
+  const y = String(d.getFullYear()).padStart(4, '0');
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return [y, m, day];
+}
+
+function recentCodexSessionDirs(now = Date.now()) {
+  // Codex stores sessions under YYYY/MM/DD. Scan only recent calendar
+  // days instead of walking the entire historical tree every overlay tick.
+  // Include a 3-day window to cover timezone edges and long overnight runs.
+  const dirs = new Set();
+  for (let back = 0; back < 3; back++) {
+    const d = new Date(now - back * 24 * 3600 * 1000);
+    const [y, m, day] = codexDateDirParts(d);
+    dirs.add(path.join(CODEX_SESSIONS_DIR, y, m, day));
+  }
+  return Array.from(dirs);
+}
+
+function recentCodexRolloutCandidates(now = Date.now()) {
+  if (now - _codexCandidateCache.at < CODEX_CANDIDATE_SCAN_TTL_MS) {
+    return _codexCandidateCache.candidates;
+  }
+  const candidates = [];
+  for (const dyDir of recentCodexSessionDirs(now)) {
+    for (const f of safeReaddir(dyDir)) {
+      if (!/^rollout-.+\.jsonl$/.test(f)) continue;
+      const fp = path.join(dyDir, f);
+      const st = safeStat(fp);
+      if (!st) continue;
+      if (now - st.mtimeMs > CODEX_ROLLOUT_AGE_MS) continue;
+      candidates.push({ path: fp, mtime: st.mtimeMs, stat: st });
+    }
+  }
+  _codexCandidateCache.at = now;
+  _codexCandidateCache.candidates = candidates;
+  return candidates;
+}
+
 function codexFirstLineCwd(filePath) {
   try {
     const fd = fs.openSync(filePath, 'r');
@@ -1691,27 +1734,8 @@ function parseCodexPlan(filePath, stat) {
 
 function readCodexSource(cwd, excl) {
   if (!cwd) return null;
-  const candidates = [];
   const now = Date.now();
-  // walk YYYY/MM/DD/ — only a few levels deep; only files modified
-  // within the last day to avoid scanning months of rollouts.
-  for (const yr of safeReaddir(CODEX_SESSIONS_DIR)) {
-    const yrDir = path.join(CODEX_SESSIONS_DIR, yr);
-    for (const mo of safeReaddir(yrDir)) {
-      const moDir = path.join(yrDir, mo);
-      for (const dy of safeReaddir(moDir)) {
-        const dyDir = path.join(moDir, dy);
-        for (const f of safeReaddir(dyDir)) {
-          if (!/^rollout-.+\.jsonl$/.test(f)) continue;
-          const fp = path.join(dyDir, f);
-          const st = safeStat(fp);
-          if (!st) continue;
-          if (now - st.mtimeMs > CODEX_ROLLOUT_AGE_MS) continue;
-          candidates.push({ path: fp, mtime: st.mtimeMs, stat: st });
-        }
-      }
-    }
-  }
+  const candidates = recentCodexRolloutCandidates(now);
   // Pre-filter by first-line cwd. Cache the cwd lookup by path: it
   // never changes after the file is created, so this is cheap.
   const matching = [];
@@ -2047,6 +2071,134 @@ function showTaskPopup(subject) {
   child.unref();
 }
 
+
+function clipDisplayText(s, max) {
+  const text = String(s || '').replace(/\s+/g, ' ').trim();
+  if (!Number.isFinite(max) || max <= 0) return '';
+  if (text.length <= max) return text;
+  if (max <= 1) return text.slice(0, max);
+  return text.slice(0, max - 1) + '…';
+}
+
+function statusKoreanLabel(status) {
+  const s = String(status || 'idle').trim() || 'idle';
+  const labels = {
+    idle: '대기(idle)',
+    running: '실행 중(running)',
+    done: '완료(done)',
+    failed: '실패(failed)',
+    'need-input': '입력 필요(need-input)',
+  };
+  return labels[s] || s;
+}
+
+function statusColor(status) {
+  const s = String(status || 'idle').trim();
+  if (s === 'running') return '\x1b[33m';
+  if (s === 'done') return '\x1b[32m';
+  if (s === 'failed') return '\x1b[31m';
+  if (s === 'need-input') return '\x1b[35m';
+  return '\x1b[2m';
+}
+
+function agentNameFromCmdline(cmdline) {
+  const c = normalizeCmdline(cmdline);
+  if (!c) return '';
+  const parts = c.split(/\s+/);
+  if (!parts.length) return '';
+  const arg0 = (parts[0] || '').split('/').pop();
+  if (typeof AGENT_BINS !== 'undefined' && AGENT_BINS.has(arg0)) return arg0;
+  if (arg0 === 'node' && parts.length >= 2) {
+    const sub = (parts[1] || '').split('/').pop();
+    if (typeof AGENT_BINS !== 'undefined' && AGENT_BINS.has(sub)) return sub;
+  }
+  return '';
+}
+
+function detectAgentNameInPane(rootPid) {
+  if (!rootPid) return '';
+  const proc = readProcIndex();
+  const agents = findAgentPidsInPane(rootPid, proc);
+  for (const pid of agents) {
+    const name = agentNameFromCmdline(proc.commands.get(String(pid)));
+    if (name) return name;
+  }
+  return '';
+}
+
+function taskOverlayStatusContext(paneId, cwd) {
+  const base = {
+    project: path.basename(cwd || process.cwd() || HOME) || 'project',
+    status: 'idle',
+    message: '',
+    mainCommand: '',
+    mainCwd: cwd || '',
+    agent: '',
+  };
+  if (!paneId) return base;
+  const out = spawnSync('tmux', ['display-message', '-p', '-t', paneId,
+    '#{session_name}:#{window_index}\t#{@nmuxlinux_project}\t#{@nmuxlinux_status}\t#{@nmuxlinux_message}'],
+    { encoding: 'utf8' });
+  if (out.status !== 0) return base;
+  const [winTarget, project, status, message] = out.stdout.trimEnd().split('\t');
+  const ctx = {
+    ...base,
+    project: project || base.project,
+    status: status || 'idle',
+    message: message || '',
+  };
+  if (!winTarget) return ctx;
+  const mainPane = findMainPaneInWindow(winTarget);
+  if (!mainPane) return ctx;
+  const minfo = spawnSync('tmux', ['display-message', '-p', '-t', mainPane,
+    '#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}'], { encoding: 'utf8' });
+  if (minfo.status !== 0) return ctx;
+  const [cmd, mainCwd, rootPid] = minfo.stdout.trimEnd().split('\t');
+  ctx.mainCommand = cmd || '';
+  ctx.mainCwd = mainCwd || ctx.mainCwd;
+  // Full process-tree agent detection is useful but expensive when every
+  // status pane performs it. Keep the overlay cheap by default; operators
+  // can enable the deeper lookup temporarily for debugging.
+  if (process.env.NMUX_TASK_OVERLAY_DETECT_AGENT === '1') {
+    ctx.agent = detectAgentNameInPane(rootPid);
+  }
+  return ctx;
+}
+
+function renderTaskOverlaySummaryLines(ctx, sourceLabel, w) {
+  const width = Math.max(20, Number(w) || 60);
+  const lines = [];
+  const project = clipDisplayText(ctx.project || 'project', Math.max(8, width - 14));
+  const src = sourceLabel && sourceLabel !== '(no source)' ? sourceLabel : '없음';
+  const status = String(ctx.status || 'idle');
+  lines.push(`\x1b[1;38;5;39m  상태판\x1b[0m  \x1b[2m· ${project}\x1b[0m`);
+  lines.push('\x1b[2m' + '─'.repeat(Math.min(width - 1, 60)) + '\x1b[0m');
+  lines.push(` \x1b[1m상태\x1b[0m  ${statusColor(status)}${statusKoreanLabel(status)}\x1b[0m`);
+  if (ctx.message) {
+    lines.push(` \x1b[1m메시지\x1b[0m  ${clipDisplayText(ctx.message, Math.max(8, width - 10))}`);
+  }
+  lines.push(` \x1b[1m작업 소스\x1b[0m  ${clipDisplayText(src, Math.max(8, width - 13))}`);
+  const main = ctx.agent ? `agent:${ctx.agent}` : (ctx.mainCommand || 'shell');
+  lines.push(` \x1b[1m메인 pane\x1b[0m  ${clipDisplayText(main, Math.max(8, width - 13))}`);
+  return lines;
+}
+
+function renderNoTaskFallbackLines(ctx, sourceLabel, w) {
+  const width = Math.max(20, Number(w) || 60);
+  const lines = [];
+  lines.push('');
+  lines.push(' \x1b[1m작업 목록\x1b[0m  없음');
+  if (sourceLabel && sourceLabel !== '(no source)') {
+    lines.push(` \x1b[2m${clipDisplayText(sourceLabel, Math.max(8, width - 3))}에 열린 작업이 없습니다\x1b[0m`);
+  } else {
+    lines.push(' \x1b[2mTODO.md / Claude / Codex / omx 작업 파일 없음\x1b[0m');
+  }
+  if (ctx.mainCwd) {
+    lines.push(` \x1b[2mcwd · ${clipDisplayText(ctx.mainCwd, Math.max(8, width - 8))}\x1b[0m`);
+  }
+  return lines;
+}
+
 function taskOverlayDaemon(cwd) {
   cwd = cwd || process.env.PWD || process.cwd();
   const paneId = process.env.TMUX_PANE || '';
@@ -2066,6 +2218,10 @@ function taskOverlayDaemon(cwd) {
   let viewportBottom = -1;       // index of last-rendered task; -1 = follow latest
   let autoFollow = true;         // if true, viewport sticks to the newest task
   let lastSortedRef = null;      // last rendered list (for click resolution)
+  let sourceCache = { at: 0, picked: null, excl: null };
+  let ctxCache = { at: 0, ctx: null };
+  const SOURCE_SCAN_MS = Math.max(5000, Number(process.env.NMUX_TASK_SOURCE_SCAN_MS || 15000));
+  const CONTEXT_SCAN_MS = Math.max(3000, Number(process.env.NMUX_TASK_CONTEXT_SCAN_MS || 10000));
 
   function applyEvents() {
     if (!paneId) return;
@@ -2102,15 +2258,22 @@ function taskOverlayDaemon(cwd) {
     // agent files / claimed cwds to the source pickers as an exclude
     // set. This is the guarantee that whatever the user runs in the
     // sub pane stays out of the status overlay.
-    const excl = collectSubPaneSessions(paneId);
-    const picked = pickActiveTaskSource(cwd, excl);
+    const now = Date.now();
+    if (!sourceCache.excl || now - sourceCache.at >= SOURCE_SCAN_MS) {
+      const excl = collectSubPaneSessions(paneId);
+      sourceCache = { at: now, excl, picked: pickActiveTaskSource(cwd, excl) };
+    }
+    if (!ctxCache.ctx || now - ctxCache.at >= CONTEXT_SCAN_MS) {
+      ctxCache = { at: now, ctx: taskOverlayStatusContext(paneId, cwd) };
+    }
+    const picked = sourceCache.picked;
     const tasks = picked ? picked.tasks : [];
     const sourceLabel = picked ? picked.source : '(no source)';
-    const lines = [];
-    lines.push('\x1b[1;38;5;39m  tasks\x1b[0m  \x1b[2m· ' + sourceLabel + '\x1b[0m');
-    lines.push('\x1b[2m' + '─'.repeat(Math.min(w - 1, 60)) + '\x1b[0m');
+    const ctx = ctxCache.ctx;
+    const lines = renderTaskOverlaySummaryLines(ctx, sourceLabel, w);
     if (!tasks.length) {
-      lines.push(' \x1b[2m(no active tasks — Claude/opencode/omx or TODO.md)\x1b[0m');
+      lines.push(...renderNoTaskFallbackLines(ctx, sourceLabel, w));
+      lastSortedRef = { rowMap: new Map() };
     } else {
       // Two-bucket stack: completed [x] above, todo [ ] below.
       // Within each bucket, oldest at top → newest at bottom. This
@@ -2196,8 +2359,8 @@ function taskOverlayDaemon(cwd) {
   // Local performance patch: the old 200ms loop was too aggressive.
   // It repeatedly walks process trees and task sources; with several open
   // projects this saturated CPU and made Codex/OMX appear stuck at Working.
-  // Default to 3000ms; allow temporary override for debugging.
-  const TASK_OVERLAY_TICK_MS = Math.max(1000, Number(process.env.NMUX_TASK_OVERLAY_TICK_MS || 3000));
+  // Default to 10s; allow temporary override for debugging.
+  const TASK_OVERLAY_TICK_MS = Math.max(3000, Number(process.env.NMUX_TASK_OVERLAY_TICK_MS || 10000));
   const timer = setInterval(tick, TASK_OVERLAY_TICK_MS);
   function exit() {
     try { process.stdout.write('\x1b[?1049l'); } catch {}
@@ -2398,8 +2561,8 @@ function watchAgentsDaemon() {
   const prevQuietTicks = new Map();  // window_id -> consecutive idle ticks
   const prevCpu = new Map();         // pid -> cumulative ticks
   const prevPtyMtime = new Map();    // pane_tty -> last seen mtime (ms)
-  const TICK_MS = 1500;
-  const CPU_ACTIVE_THRESHOLD = 60;   // ~600ms CPU/1.5s — heavy tool
+  const TICK_MS = Math.max(2000, Number(process.env.NMUX_WATCHER_TICK_MS || 3000));
+  const CPU_ACTIVE_THRESHOLD = 60;   // ~600ms CPU/sample — heavy tool
                                      // execution only. Tuned higher
                                      // than 12 (previous value) because
                                      // codex/omx daemons emit periodic
@@ -2414,8 +2577,8 @@ function watchAgentsDaemon() {
                                      // (streamed tokens / quick output)
                                      // since heartbeats never write to
                                      // the visible buffer.
-  const QUIET_TICKS_TO_DONE = 8;     // running→done after 8 idle ticks
-                                     // (~12 s). Long enough that an LLM
+  const QUIET_TICKS_TO_DONE = 4;     // running→done after ~12 idle seconds
+                                     // by default. Long enough that an LLM
                                      // briefly thinking between bursts
                                      // doesn't flicker the indicator,
                                      // short enough that the user sees
@@ -2449,7 +2612,7 @@ function watchAgentsDaemon() {
   }
 
   function tick() {
-    if (!sessionExists(SESSION)) return;
+    if (!sessionExists(SESSION)) { cleanup(); process.exit(0); }
     let out;
     try {
       out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
@@ -3034,5 +3197,14 @@ function main() {
   process.exit(2);
 }
 
-try { main(); }
-catch (e) { console.error('[nmux-linux] ' + (e.message || e)); process.exit(1); }
+if (require.main === module) {
+  try { main(); }
+  catch (e) { console.error('[nmux-linux] ' + (e.message || e)); process.exit(1); }
+} else {
+  module.exports = {
+    clipDisplayText,
+    statusKoreanLabel,
+    renderTaskOverlaySummaryLines,
+    renderNoTaskFallbackLines,
+  };
+}

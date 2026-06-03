@@ -1,6 +1,6 @@
 {
   "name": "nmux-linux",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Linux-native tmux front-end for multi-project agent workspaces.",
   "license": "MIT",
   "bin": {
