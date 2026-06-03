@@ -3,7 +3,7 @@
 // per-project window, persistent open-set, agent-finish notifier.
 // Layout per window: sidebar (left) | main shell | right-top / right-bot.
 
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -60,6 +60,10 @@ Usage:
   nmux-linux close-current         close current window (saves state)
   nmux-linux relayout              rebuild current window into sidebar | main | right(top/bot)
   nmux-linux fix-layout            re-pin sidebar width across windows (called by hooks)
+  nmux-linux clean-omx-hud         remove definite omx HUD panes from nmux-linux
+  nmux-linux preview [--external|--cmd] [--focus] <url|command>
+                                   show a terminal-native preview in right-top
+  nmux-linux webview ...           alias for preview
   nmux-linux disable-omx-hud       patch omx reconcile.js + set NMUX_LINUX_DISABLE_HUD=1
                              so omx stops auto-spawning the bottom HUD pane
   nmux-linux save-state            persist current open-windows
@@ -226,23 +230,69 @@ function installBindings(session) {
     // ~/.local/lib/node_modules/oh-my-codex/dist/hud/reconcile.js.
     `set-environment -t ${session} NMUX_LINUX_DISABLE_HUD 1`,
 
-    // Mouse on sidebar pane → nmux-linux click <y> <x>
-    `bind-key -T root MouseDown1Pane if-shell -F "#{&&:#{==:#{session_name},${session}},#{==:#{pane_title},nmux-linux-sidebar}}" "run-shell '${NMUX_BIN} click #{mouse_y} #{mouse_x} #{pane_id}'" "select-pane -t="`,
+    // Mouse on sidebar pane → nmux-linux click <y> <x>.
+    // Bound to MouseUp1Pane (not MouseDown1Pane) so drag-selection still
+    // works: MouseDrag1Pane fires copy-mode -M, copy-mode captures the
+    // rest of the gesture, and MouseUp1Pane in the root table is bypassed.
+    // A bare tap (down+up no drag) keeps reaching us, fires the click
+    // handler. MouseDown1Pane is explicitly re-asserted to tmux's stock
+    // `select-pane -t=` so a refresh after the binding moved from
+    // MouseDown→MouseUp doesn't leave behind a stale ours-only mapping.
+    //
+    // `-b` is critical: without it, run-shell blocks the entire tmux
+    // server for the click handler's lifetime (~30-100ms). Backgrounded
+    // hooks (fix-layout, clear-status) plus user input pile up behind
+    // each click, so a burst of clicks feels "stuck" for half a second
+    // and then catches up all at once. Backgrounding makes the binding
+    // fire-and-forget — the user's next click is processed immediately.
+    `bind-key -T root MouseDown1Pane select-pane -t=`,
+    // 3-way click routing dispatched via node — nested tmux
+    // if-shell with double quotes inside its branch strings can't
+    // be parsed by tmux (treated as "too many arguments"), so we
+    // do the routing in JS.
+    `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_BIN} mouseup #{pane_id} #{session_name} #{pane_title} #{mouse_y} #{mouse_x}'`,
+
+    // Wheel routing: a tiny node helper does the 3-way dispatch
+    // (sidebar swallow / right-top → daemon / else → copy-mode).
+    // Nested tmux if-shell quoting was unmanageable across two
+    // levels, so we move the routing out of the tmux config.
+    `bind-key -T root WheelUpPane run-shell -b '${NMUX_BIN} wheel up #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
+    `bind-key -T root WheelDownPane run-shell -b '${NMUX_BIN} wheel down #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
+
+    // Double-click on a non-sidebar nmux-linux pane fires only the URL
+    // launcher (background): capture pane wrap-joined, find the URL on
+    // the clicked visual row (incl. wrapped halves), xdg-open + wl-copy.
+    // We deliberately do NOT chain the stock copy-mode -H ; select-word
+    // ; run-shell -d 0.3 ; copy-pipe-and-cancel sequence — that 0.3s
+    // window leaves the pane in copy-mode-vi where any subsequent
+    // keystroke (f, ;, t, ,, /, ?) gets interpreted as a vi-jump
+    // command, popping the "(jump forward)" prompt and absorbing all
+    // following clicks until cancelled. Word-copy via double-click is
+    // sacrificed; drag-select still works through the wlcopy --join
+    // helper for any text-grab need.
+    `bind-key -T root DoubleClick1Pane select-pane -t= \\; if-shell -F "#{&&:#{==:#{session_name},${session}},#{!=:#{pane_title},nmux-linux-sidebar}}" "run-shell -b '${NMUX_BIN} click-url #{pane_id} #{mouse_y}'" ""`,
 
     // Prefix
     `bind-key -T prefix C run-shell "${NMUX_BIN} prompt"`,
     `bind-key -T prefix X run-shell "${NMUX_BIN} close-current"`,
 
-    // Bell-driven notify (safety net for tools that emit \\a on completion).
-    `set-window-option -g monitor-bell on`,
-    `set-hook -g alert-bell "run-shell -b '${NMUX_BIN} notify --project \\"#{@nmuxlinux_project}\\" --status done --message bell >/dev/null 2>&1 || true'"`,
+    // Bell-driven notify intentionally disabled: a stray bell from any
+    // process inside a project window would flip status to done + push a
+    // "bell" message line, shifting the sidebar layout. Real completion
+    // signals come from the Claude/omx hooks instead.
+    `set-window-option -g monitor-bell off`,
 
     // Sidebar fix-up: tmux scales panes proportionally on resize/attach,
     // so the sidebar stretches when a wider client attaches. Pin it back.
-    `set-hook -g client-attached "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g client-resized "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g window-resized "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g after-split-window "run-shell -b '${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    // We deliberately do NOT hook after-resize-pane / after-kill-pane:
+    // those events fire FROM fix-layout's own resize-pane calls, which
+    // produces an unbounded hook-storm. Manual border drags are caught
+    // by the sidebar process's own width self-correction in
+    // bin/nmux-linux-sidebar (selfCorrectWidth) instead.
+    `set-hook -g client-attached "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g client-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g window-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g after-split-window "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
 
     // Visiting a window clears its bell/done indicator (the ✓ in the sidebar).
     `set-hook -g after-select-window "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
@@ -294,7 +344,7 @@ function buildWindow(cfg, project, isFirst) {
 
 function buildLayout(cfg, target, project, cwd, shell) {
   // Title the active pane (main shell created by new-window/new-session).
-  tmux(['select-pane', '-t', target, '-T', project.name], { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', paneTitleFor(project.name, 'main')], { allowFail: true });
 
   // Split LEFT for sidebar (fixed cells).
   tmux(['split-window', '-t', target, '-b', '-h', '-l', String(cfg.sidebarWidth || SIDEBAR_WIDTH),
@@ -305,19 +355,63 @@ function buildLayout(cfg, target, project, cwd, shell) {
   // Back to main.
   tmux(['select-pane', '-t', target, '-R'], { allowFail: true });
 
-  // Split main horizontally → right column (33% of remaining width).
-  // Use `-l N%` (modern tmux 3.0+) instead of deprecated `-p N`.
-  tmux(['split-window', '-t', target, '-h', '-l', `${RIGHT_PERCENT}%`,
-        '-c', cwd, shell], { allowFail: true });
-  tmux(['select-pane', '-t', target, '-T', 'right-top'], { allowFail: true });
+  // Layout (left → right): sidebar | main | status/bash column [| sub]
+  //   sub is only created on ultrawide monitors; 16:9 screens aren't
+  //   wide enough for four equal columns and the user prefers to
+  //   reclaim that space for main.
+  //   wide  : main = W/2 - sw,        status = W/6, sub = W/3
+  //   16:9  : main = W - sw - status, status = W/6
+  const winInfo = tmux(['display-message', '-p', '-t', target,
+    '#{window_width}\t#{window_height}'], { allowFail: true }).trim();
+  const [wwStr, whStr] = winInfo.split('\t');
+  const winW = parseInt(wwStr, 10);
+  const winH = parseInt(whStr, 10);
+  const sw = cfg.sidebarWidth || SIDEBAR_WIDTH;
+  const wide = isWideAspect(winW, winH);
+  const safeW = (Number.isFinite(winW) && winW > sw + 120) ? winW : (sw + 180);
+  const rightW = Math.max(24, Math.floor(safeW / 6));
+  const subW = wide ? Math.max(40, Math.floor(safeW / 3)) : 0;
 
-  // Split right column vertically → right-bottom (50% of right column height).
-  tmux(['split-window', '-t', target, '-v', '-l', '50%', '-c', cwd, shell], { allowFail: true });
-  tmux(['select-pane', '-t', target, '-T', 'right-bot'], { allowFail: true });
+  const TITLE_SUB = paneTitleFor(project.name, 'sub');
+  const TITLE_STATUS = paneTitleFor(project.name, 'status');
+  const TITLE_BASH = paneTitleFor(project.name, 'bash');
 
-  // Focus main again (right-bot → up to right-top → left to main).
+  if (wide) {
+    // Step 1: from main, split → sub at far right.
+    tmux(['split-window', '-t', target, '-h', '-l', String(subW), '-c', cwd, shell],
+      { allowFail: true });
+    tmux(['select-pane', '-t', target, '-T', TITLE_SUB], { allowFail: true });
+    tmux(['select-pane', '-t', target, '-L'], { allowFail: true });
+  }
+
+  // Step 2: from main, split → status pane (status column ends up
+  // between main and sub on wide, or at the far right on 16:9).
+  tmux(['split-window', '-t', target, '-h', '-l', String(rightW), '-c', cwd,
+        `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+    { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', TITLE_STATUS], { allowFail: true });
+
+  // Step 3: split status vertically → bash.
+  tmux(['split-window', '-t', target, '-v', '-l', '50%', '-c', cwd, shell],
+    { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', TITLE_BASH], { allowFail: true });
+
+  // Focus back to main (bash → status up → main left).
   tmux(['select-pane', '-t', target, '-U'], { allowFail: true });
   tmux(['select-pane', '-t', target, '-L'], { allowFail: true });
+}
+
+// Aspect detection. Terminal cells are roughly 2× taller than wide,
+// so a 16:9 pixel monitor is ~3.5 in cell ratio while a 21:9
+// ultrawide is ~4.8 and 32:9 super-ultrawide ~7. Threshold of 4.0
+// reliably separates "show 4-column layout" from "fall back to 3
+// columns". `width >= 300` is a safety net for huge windows whose
+// height we can't trust (some terminals report inflated height).
+function isWideAspect(winW, winH) {
+  if (!Number.isFinite(winW)) return false;
+  if (winW >= 300) return true;
+  if (!Number.isFinite(winH) || winH <= 0) return false;
+  return (winW / winH) >= 4.0;
 }
 
 function relayoutCurrent() {
@@ -337,7 +431,10 @@ function relayoutCurrent() {
   });
   const sidebar = all.find(p => p.isSidebar);
   const candidates = all.filter(p => !p.isSidebar);
-  const main = candidates.find(p => p.title === projName) || candidates[0];
+  const main = candidates.find(p => p.title === paneTitleFor(projName, 'main'))
+            || candidates.find(p => p.title === projName) // legacy plain-name
+            || candidates.find(p => paneRoleOf(p.title) === null)
+            || candidates[0];
   if (!main) { console.error('no main pane found'); return; }
   // Kill every pane except sidebar and main.
   for (const p of candidates) {
@@ -355,12 +452,34 @@ function relayoutCurrent() {
     // Resize sidebar back to configured width.
     tmux(['resize-pane', '-t', sidebar.pid, '-x', String(cfg.sidebarWidth || SIDEBAR_WIDTH)], { allowFail: true });
   }
-  // Now main is alone (right of sidebar). Add right column with 2 stacked panes.
+  // Mirror buildLayout exactly: sidebar | main | status/bash [| sub]
+  tmux(['select-pane', '-t', main.pid, '-T', paneTitleFor(projName, 'main')],
+    { allowFail: true });
   tmux(['select-pane', '-t', main.pid], { allowFail: true });
-  tmux(['split-window', '-t', main.pid, '-h', '-l', `${RIGHT_PERCENT}%`, '-c', cwd, shell], { allowFail: true });
-  tmux(['select-pane', '-t', target, '-T', 'right-top'], { allowFail: true });
-  tmux(['split-window', '-t', target, '-v', '-l', '50%', '-c', cwd, shell], { allowFail: true });
-  tmux(['select-pane', '-t', target, '-T', 'right-bot'], { allowFail: true });
+  const winInfoR = tmux(['display-message', '-p', '-t', target,
+    '#{window_width}\t#{window_height}'], { allowFail: true }).trim();
+  const [wwR, whR] = winInfoR.split('\t').map(n => parseInt(n, 10));
+  const swR = cfg.sidebarWidth || SIDEBAR_WIDTH;
+  const wideR = isWideAspect(wwR, whR);
+  const safeWR = (Number.isFinite(wwR) && wwR > swR + 120) ? wwR : (swR + 180);
+  const rightWR = Math.max(24, Math.floor(safeWR / 6));
+  const subWR = wideR ? Math.max(40, Math.floor(safeWR / 3)) : 0;
+  if (wideR) {
+    tmux(['split-window', '-t', main.pid, '-h', '-l', String(subWR), '-c', cwd, shell],
+      { allowFail: true });
+    tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'sub')],
+      { allowFail: true });
+    tmux(['select-pane', '-t', main.pid], { allowFail: true });
+  }
+  tmux(['split-window', '-t', main.pid, '-h', '-l', String(rightWR), '-c', cwd,
+    `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+    { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'status')],
+    { allowFail: true });
+  tmux(['split-window', '-t', target, '-v', '-l', '50%', '-c', cwd, shell],
+    { allowFail: true });
+  tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'bash')],
+    { allowFail: true });
   tmux(['select-pane', '-t', main.pid], { allowFail: true });
   console.log('relayout done');
 }
@@ -519,12 +638,13 @@ function closeCurrent() {
 function killOmxHudPanes() {
   // Identify panes whose process tree runs `omx hud --watch` and kill them.
   if (!sessionExists(SESSION)) return 0;
-  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F', '#{pane_id}\t#{pane_pid}'], { allowFail: true });
+  const proc = readProcIndex();
+  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F', '#{pane_id}\t#{pane_pid}\t#{pane_current_command}'], { allowFail: true });
   let killed = 0;
   for (const line of out.split('\n')) {
     if (!line) continue;
-    const [pid, ppid] = line.split('\t');
-    if (paneIsOmxHud(ppid)) {
+    const [pid, ppid, paneCmd] = line.split('\t');
+    if (paneIsOmxHud(ppid, proc, paneCmd)) {
       tmux(['kill-pane', '-t', pid], { allowFail: true });
       killed++;
     }
@@ -532,27 +652,55 @@ function killOmxHudPanes() {
   return killed;
 }
 
-function paneIsOmxHud(rootPid) {
+function normalizeCmdline(cmd) {
+  return String(cmd || '').replace(/\0/g, ' ').trim();
+}
+
+function commandLooksLikeOmxHud(cmd) {
+  const c = normalizeCmdline(cmd);
+  if (!c) return false;
+  return /(?:^|\s)hud\s+.*?--watch(?:[\s=]|$)/.test(c)
+    && /(?:^|[\/\s])(?:omx|omx\.js)(?:[\s]|$)/.test(c);
+}
+
+function readProcIndex() {
+  const commands = new Map();
+  const children = new Map();
+  try {
+    for (const ent of fs.readdirSync('/proc')) {
+      if (!/^\d+$/.test(ent)) continue;
+      const pid = String(ent);
+      let ppid = null;
+      try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        ppid = stat.split(') ').pop().split(' ')[1];
+      } catch {}
+      if (ppid) {
+        if (!children.has(ppid)) children.set(ppid, []);
+        children.get(ppid).push(pid);
+      }
+      try {
+        commands.set(pid, fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'));
+      } catch {}
+    }
+  } catch {}
+  return { commands, children };
+}
+
+function paneIsOmxHud(rootPid, proc = readProcIndex(), paneCurrentCommand = '') {
   if (!rootPid) return false;
+  if (paneCurrentCommand && paneCurrentCommand !== 'omx' && paneCurrentCommand !== 'node') {
+    // Fast negative for common shells/editors; still inspect descendants when
+    // tmux reports a generic launcher that could own the real omx process.
+  }
   const stack = [String(rootPid)];
+  const seen = new Set();
   while (stack.length) {
     const p = stack.pop();
-    try {
-      const cmd = fs.readFileSync(`/proc/${p}/cmdline`, 'utf8');
-      if (/omx[^/]*\bhud\b/.test(cmd) || cmd.includes('hud --watch')) return true;
-    } catch {}
-    try {
-      // breadth via reading children — best-effort
-      const procs = fs.readdirSync('/proc');
-      for (const child of procs) {
-        if (!/^\d+$/.test(child)) continue;
-        try {
-          const stat = fs.readFileSync(`/proc/${child}/stat`, 'utf8');
-          const ppid = stat.split(') ').pop().split(' ')[1];
-          if (String(ppid) === p) stack.push(child);
-        } catch {}
-      }
-    } catch {}
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    if (commandLooksLikeOmxHud(proc.commands.get(p))) return true;
+    for (const child of proc.children.get(p) || []) stack.push(child);
   }
   return false;
 }
@@ -706,28 +854,251 @@ function enableOmxHud() {
   }
 }
 
+function hudSuppressionActive() {
+  if (process.env.NMUX_LINUX_DISABLE_HUD === '1' || process.env.OMX_HUD_DISABLE === '1') return true;
+  if (fs.existsSync(HUD_DISABLE_MARKER)) return true;
+  if (sessionExists(SESSION)) {
+    const env = tmux(['show-environment', '-t', SESSION, 'NMUX_LINUX_DISABLE_HUD'], { allowFail: true });
+    if (/NMUX_LINUX_DISABLE_HUD=1/.test(env)) return true;
+  }
+  return false;
+}
+
 function fixLayout() {
   // tmux scales panes proportionally on resize; pin sidebar back to its
   // configured cell-width across all nmux-linux windows. Also ensures right
   // column halves the post-sidebar area so main is sidebar→middle.
+  if (process.env.NMUX_LINUX_HOOK_SESSION && process.env.NMUX_LINUX_HOOK_SESSION !== SESSION) return;
   if (!sessionExists(SESSION)) return;
   const cfg = loadConfig() || initConfig();
   const sw = Number(cfg.sidebarWidth) || SIDEBAR_WIDTH;
+  // Pull current widths so we can SKIP resize-pane when the sidebar is
+  // already correctly sized. Without this guard, hooks that fire on
+  // pane resize (we don't currently install them, but a no-op resize
+  // still costs a fork+exec per sidebar per hook invocation).
   const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
-    '#{window_id}\t#{pane_id}\t#{pane_title}\t#{pane_pid}\t#{pane_left} #{pane_top}'],
+    '#{window_id}\t#{window_index}\t#{pane_id}\t#{pane_title}\t#{pane_pid}\t#{pane_width}\t#{@nmuxlinux_project}'],
     { allowFail: true });
   const byWin = new Map();
   for (const line of out.split('\n')) {
     if (!line) continue;
-    const [wid, pid, title, ppid, leftTop] = line.split('\t');
+    const [wid, widx, pid, title, ppid, widthStr, proj] = line.split('\t');
     const isSidebar = title === 'nmux-linux-sidebar' || isSidebarPid(ppid);
-    if (!byWin.has(wid)) byWin.set(wid, []);
-    byWin.get(wid).push({ pid, title, isSidebar, leftTop });
+    const width = parseInt(widthStr, 10) || 0;
+    if (!byWin.has(wid)) byWin.set(wid, { idx: widx, proj, panes: [] });
+    byWin.get(wid).panes.push({ pid, title, isSidebar, width });
   }
-  for (const [wid, panes] of byWin) {
-    const sidebar = panes.find(p => p.isSidebar);
-    if (sidebar) tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
+  for (const [, info] of byWin) {
+    const sidebar = info.panes.find(p => p.isSidebar);
+    if (sidebar && sidebar.width !== sw) {
+      tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
+    }
+    rebuildMissingMain(cfg, info);
   }
+  if (hudSuppressionActive()) killOmxHudPanes();
+}
+
+// If a window has a sidebar but no "main" project pane, the layout looks
+// broken — the user clicks the project in the sidebar and lands on a
+// half-empty window with no shell. Re-add the main shell adjacent to the
+// sidebar without touching the right column (which may hold the user's
+// running work). Idempotent: bails out when a main is already present.
+function rebuildMissingMain(cfg, info) {
+  if (!info || !info.panes.length) return;
+  const sidebar = info.panes.find(p => p.isSidebar);
+  if (!sidebar) return;
+  const main = info.panes.find(p => !p.isSidebar && !isReservedPaneTitle(p.title));
+  if (main) return;
+  const projName = info.proj;
+  if (!projName) return;
+  const proj = (cfg.projects || []).find(p => p.name === projName);
+  const cwd = (proj && proj.cwd) || process.env.HOME || '/';
+  const shell = process.env.SHELL || '/bin/bash';
+  // Split the sidebar so the new main appears to its right. `-P -F` makes
+  // tmux print the new pane id so we can address it directly afterwards
+  // (the previously-active "{last}" pane is the sidebar — wrong target).
+  const newPaneId = tmux(['split-window', '-t', sidebar.pid, '-h', '-c', cwd,
+    '-P', '-F', '#{pane_id}', shell], { allowFail: true }).trim();
+  // Tag the new pane with the project name so subsequent findMainPane /
+  // focusMainPane calls can locate it.
+  if (newPaneId) tmux(['select-pane', '-t', newPaneId, '-T', paneTitleFor(projName, 'main')], { allowFail: true });
+  // Re-pin the sidebar — the split shrank it by half.
+  const sw = Number(cfg.sidebarWidth) || SIDEBAR_WIDTH;
+  tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
+  // The new main is half of the original sidebar (≈13 cells). Grow it to
+  // roughly (window_width - sidebar)/2 so the layout matches a freshly
+  // built window. Read window_width post-resize so border cells are
+  // accounted for.
+  if (newPaneId) {
+    const winInfo = tmux(['display-message', '-p', '-t', `${cfg.session}:${info.idx}`,
+      '#{window_width}'], { allowFail: true }).trim();
+    const winW = parseInt(winInfo, 10);
+    if (Number.isFinite(winW) && winW > sw + 4) {
+      const mainW = Math.max(20, Math.floor((winW - sw) / 2));
+      tmux(['resize-pane', '-t', newPaneId, '-x', String(mainW)], { allowFail: true });
+    }
+  }
+}
+
+// Respawn each window's right-top pane so it runs the task overlay.
+// right-bot stays as the user-owned bash shell under the new 3-column
+// layout — no overlay there so ad-hoc commands aren't fighting a
+// redrawing TUI. For git status in that pane, run
+// `nmux-linux git-overlay --cwd <path>` manually.
+function refreshOverlays() {
+  if (!sessionExists(SESSION)) return;
+  const cfg = loadConfig() || initConfig();
+  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
+    '#{window_index}\t#{pane_id}\t#{pane_title}\t#{@nmuxlinux_project}\t#{pane_current_path}'],
+    { allowFail: true });
+  let topCount = 0;
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [, pid, title, proj, paneCwd] = line.split('\t');
+    if (paneRoleOf(title) !== 'status') continue;
+    const project = (cfg.projects || []).find(p => p.name === proj);
+    const cwd = (project && project.cwd) || paneCwd || HOME;
+    tmux(['respawn-pane', '-k', '-t', pid, '-c', cwd,
+      `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`], { allowFail: true });
+    tmux(['select-pane', '-t', pid, '-T', paneTitleFor(proj || '', 'status')], { allowFail: true });
+    topCount++;
+  }
+  console.log(`refreshed ${topCount} right-top pane(s); right-bot left as user shell`);
+}
+
+// Retrofit existing windows to the 3-column layout: add a `code-mid`
+// pane to the right of the main coding pane. Preserves main's process
+// (no respawn) so any running agent / editor stays alive. Right
+// column is left as-is — that work survives too.
+// Non-destructive: walk every nmux-linux window and resize the
+// existing 5-pane layout to match the configured proportions. No
+// kill-pane, no respawn — user's running work is preserved.
+// Apply the canonical layout across every existing nmux-linux window:
+// retitle to project-prefixed names, reorder columns so the status/bash
+// column sits between main and sub (or drop sub on 16:9), and resize
+// to the spec'd proportions. Destructive only for right-top/right-bot
+// (task-overlay daemon is regenerated; right-bot bash loses history).
+// Main and sub processes are preserved.
+function resizeCols() {
+  if (!sessionExists(SESSION)) return;
+  const cfg = loadConfig() || initConfig();
+  const sw = cfg.sidebarWidth || SIDEBAR_WIDTH;
+  const shell = process.env.SHELL || '/bin/bash';
+  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
+    '#{window_index}\t#{pane_id}\t#{pane_title}\t#{window_width}\t#{window_height}\t#{@nmuxlinux_project}\t#{pane_current_path}'],
+    { allowFail: true });
+  const byWin = new Map();
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [widx, pid, title, ww, wh, proj, paneCwd] = line.split('\t');
+    if (!byWin.has(widx)) byWin.set(widx, {
+      winW: parseInt(ww, 10), winH: parseInt(wh, 10), proj, paneCwd, panes: [],
+    });
+    byWin.get(widx).panes.push({ pid, title });
+  }
+  let resized = 0, skipped = 0;
+  for (const [widx, info] of byWin) {
+    const sidebar = info.panes.find(p => p.title === 'nmux-linux-sidebar');
+    if (!sidebar) { skipped++; continue; }
+    const nonSidebar = info.panes.filter(p => p.pid !== sidebar.pid);
+    const status = nonSidebar.find(p => paneRoleOf(p.title) === 'status');
+    const bash = nonSidebar.find(p => paneRoleOf(p.title) === 'bash');
+    let sub = nonSidebar.find(p => paneRoleOf(p.title) === 'sub');
+    // Main is whatever's left after extracting reserved roles.
+    const main = nonSidebar.find(p => {
+      const r = paneRoleOf(p.title);
+      return r === 'main' || r === null; // null = legacy plain title
+    });
+    if (!main) { skipped++; continue; }
+    const projName = info.proj || '';
+    if (!projName) { skipped++; continue; }
+    const project = (cfg.projects || []).find(p => p.name === projName);
+    const cwd = (project && project.cwd) || info.paneCwd || HOME;
+    const wide = isWideAspect(info.winW, info.winH);
+    const safeW = (Number.isFinite(info.winW) && info.winW > sw + 120) ? info.winW : (sw + 180);
+    const rightW = Math.max(24, Math.floor(safeW / 6));
+    const subW = wide ? Math.max(40, Math.floor(safeW / 3)) : 0;
+    const mainW = Math.max(40, wide
+      ? Math.floor(safeW / 2) - sw
+      : (safeW - sw - rightW - 1));
+
+    // Step 1: drop the right column (always — we rebuild it on the
+    // correct side of sub). Drop sub too if we're on a 16:9 display.
+    if (status) tmux(['kill-pane', '-t', status.pid], { allowFail: true });
+    if (bash) tmux(['kill-pane', '-t', bash.pid], { allowFail: true });
+    if (!wide && sub) {
+      tmux(['kill-pane', '-t', sub.pid], { allowFail: true });
+      sub = null;
+    }
+
+    const target = `${SESSION}:${widx}`;
+
+    // Step 2: split right of main → status column. Inserts BETWEEN
+    // main and sub (on wide) or at the far right (on 16:9). Width
+    // approximated; we re-resize at the end.
+    tmux(['split-window', '-t', main.pid, '-h', '-l', String(rightW), '-c', cwd,
+      `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+      { allowFail: true });
+    tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'status')],
+      { allowFail: true });
+    tmux(['split-window', '-t', target, '-v', '-l', '50%', '-c', cwd, shell],
+      { allowFail: true });
+    tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'bash')],
+      { allowFail: true });
+
+    // Step 3: retitle main + sub.
+    tmux(['select-pane', '-t', main.pid, '-T', paneTitleFor(projName, 'main')],
+      { allowFail: true });
+    if (sub) {
+      tmux(['select-pane', '-t', sub.pid, '-T', paneTitleFor(projName, 'sub')],
+        { allowFail: true });
+    }
+
+    // Step 4: converge widths (two passes — first one perturbs
+    // neighbours, second corrects).
+    const newStatus = tmux(['list-panes', '-t', target, '-F',
+      '#{pane_id}\t#{pane_title}'], { allowFail: true }).split('\n')
+      .filter(Boolean).map(l => l.split('\t'))
+      .find(([_, t]) => paneRoleOf(t) === 'status');
+    for (let pass = 0; pass < 2; pass++) {
+      tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
+      tmux(['resize-pane', '-t', main.pid, '-x', String(mainW)], { allowFail: true });
+      if (sub) tmux(['resize-pane', '-t', sub.pid, '-x', String(subW)], { allowFail: true });
+      if (newStatus) tmux(['resize-pane', '-t', newStatus[0], '-x', String(rightW)], { allowFail: true });
+    }
+    tmux(['select-pane', '-t', main.pid], { allowFail: true });
+    resized++;
+  }
+  console.log(`resized ${resized} window(s); ${skipped} skipped`);
+}
+
+function relayout3col() {
+  if (!sessionExists(SESSION)) return;
+  const cfg = loadConfig() || initConfig();
+  const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
+    '#{window_index}\t#{pane_id}\t#{pane_title}\t#{@nmuxlinux_project}\t#{pane_current_path}'],
+    { allowFail: true });
+  const byWin = new Map();
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [widx, pid, title, proj, paneCwd] = line.split('\t');
+    if (!byWin.has(widx)) byWin.set(widx, { proj, paneCwd, panes: [] });
+    byWin.get(widx).panes.push({ pid, title });
+  }
+  const shell = process.env.SHELL || '/bin/bash';
+  let added = 0, skipped = 0;
+  for (const [widx, info] of byWin) {
+    if (info.panes.some(p => paneRoleOf(p.title) === 'sub')) { skipped++; continue; }
+    const main = info.panes.find(p => !isReservedPaneTitle(p.title));
+    if (!main) { skipped++; continue; }
+    const project = (cfg.projects || []).find(p => p.name === info.proj);
+    const cwd = (project && project.cwd) || info.paneCwd || HOME;
+    tmux(['split-window', '-t', main.pid, '-h', '-l', '50%', '-c', cwd, shell], { allowFail: true });
+    tmux(['select-pane', '-t', `${SESSION}:${widx}`, '-T', paneTitleFor(info.proj || '', 'sub')], { allowFail: true });
+    tmux(['select-pane', '-t', main.pid], { allowFail: true });
+    added++;
+  }
+  console.log(`added code-mid to ${added} window(s); ${skipped} already had it or no main`);
 }
 
 function refreshSidebars() {
@@ -801,14 +1172,40 @@ function clickmapPathFor(paneId) {
   return path.join(CLICKMAP_DIR, `${paneId || 'default'}.txt`);
 }
 
+// Append-only debug log for click events. The mouse binding now uses
+// run-shell -b so errors thrown here would be swallowed silently — a
+// "stuck" click would look identical to a successful one to the user.
+// The log lets us reconstruct what happened post-hoc by timestamp.
+// Capped at ~256 KiB; older content is dropped on rotation so the file
+// never grows unbounded on long-running sessions.
+const CLICK_LOG = path.join(CONFIG_DIR, 'click.log');
+const CLICK_LOG_MAX_BYTES = 256 * 1024;
+function logClick(msg) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    try {
+      const st = fs.statSync(CLICK_LOG);
+      if (st.size > CLICK_LOG_MAX_BYTES) {
+        const tail = fs.readFileSync(CLICK_LOG).slice(-CLICK_LOG_MAX_BYTES / 2);
+        fs.writeFileSync(CLICK_LOG, tail);
+      }
+    } catch {}
+    fs.appendFileSync(CLICK_LOG, `${new Date().toISOString()} pid=${process.pid} ${msg}\n`);
+  } catch {}
+}
+
 function clickHandler(rowStr, colStr, paneId) {
   const row = parseInt(rowStr, 10);
   const col = parseInt(colStr, 10) || 0;
-  if (!Number.isFinite(row)) return;
+  if (!Number.isFinite(row)) { logClick(`bad-row row=${rowStr} col=${colStr} pane=${paneId}`); return; }
   // Per-pane clickmap so a click in pane A is never resolved against
   // pane B's stale rows. tmux passes #{pane_id} into the binding.
   const cmFile = clickmapPathFor(paneId);
-  if (!fs.existsSync(cmFile)) return;
+  if (!fs.existsSync(cmFile)) {
+    logClick(`no-clickmap row=${row} col=${col} pane=${paneId} file=${cmFile}`);
+    return;
+  }
+  const cmStat = fs.statSync(cmFile);
   const lines = fs.readFileSync(cmFile, 'utf8').split('\n');
   // Each entry: row<TAB>action<TAB>arg<TAB>colMin
   // Pick the entry with the highest colMin <= col on the matching row.
@@ -822,24 +1219,1352 @@ function clickHandler(rowStr, colStr, paneId) {
     if (col < colMin) continue;
     if (!best || colMin > best.colMin) best = { action: parts[1], arg: parts[2] || '', colMin };
   }
-  if (!best) return;
-  switch (best.action) {
-    case 'switch':
-      if (process.env.TMUX) tmux(['select-window', '-t', `${SESSION}:${best.arg}`], { allowFail: true });
-      else spawnSync('tmux', ['switch-client', '-t', `${SESSION}:${best.arg}`], { stdio: 'ignore' });
-      break;
-    case 'close':
-      closeWindow(best.arg);
-      break;
-    case 'reopen':
-      try { openProject(best.arg); } catch (e) { console.error(e.message); }
-      break;
-    case 'add':
-      promptCommand();
-      break;
-    case 'kill':
-      confirmKill();
-      break;
+  if (!best) {
+    const cmAgeMs = Date.now() - cmStat.mtimeMs;
+    logClick(`no-match row=${row} col=${col} pane=${paneId} clickmap_age_ms=${cmAgeMs} lines=${lines.length}`);
+    return;
+  }
+  logClick(`dispatch action=${best.action} arg=${best.arg} row=${row} col=${col} pane=${paneId}`);
+  try {
+    switch (best.action) {
+      case 'switch': {
+        const target = `${SESSION}:${best.arg}`;
+        // Mark the click so the watcher daemon ignores PTY redraw noise
+        // for a few seconds. tmux's select-window / select-pane below
+        // causes the pane to repaint, which bumps the PTY's mtime once
+        // — without this marker the watcher would read that as fresh
+        // agent activity and flip the row to "running" the moment the
+        // user clicked. The marker is a wall-clock ms timestamp.
+        spawnSync('tmux', ['set-window-option', '-t', target,
+          '@nmuxlinux_clicked_at', String(Date.now())], { stdio: 'ignore' });
+        if (process.env.TMUX) {
+          const r = spawnSync('tmux', ['select-window', '-t', target], { encoding: 'utf8' });
+          logClick(`switch select-window target=${target} rc=${r.status} stderr=${(r.stderr || '').trim().slice(0, 200)}`);
+        } else {
+          const r = spawnSync('tmux', ['switch-client', '-t', target], { encoding: 'utf8' });
+          logClick(`switch switch-client target=${target} rc=${r.status} stderr=${(r.stderr || '').trim().slice(0, 200)}`);
+        }
+        focusMainPane(target);
+        break;
+      }
+      case 'close':
+        closeWindow(best.arg);
+        logClick(`close-window arg=${best.arg}`);
+        break;
+      case 'reopen':
+        try { openProject(best.arg); }
+        catch (e) { logClick(`reopen-error arg=${best.arg} err=${(e.message || e).slice(0, 200)}`); console.error(e.message); }
+        break;
+      case 'add':
+        promptCommand();
+        break;
+      case 'kill':
+        confirmKill();
+        break;
+    }
+  } catch (e) {
+    logClick(`dispatch-throw action=${best.action} err=${(e.message || e).slice(0, 200)}`);
+  }
+}
+
+// Wrap-aware URL launcher for double-clicks in non-sidebar panes.
+// tmux's stock select-word stops at visual-line boundaries, so a URL
+// that wraps onto two rows is split — clicking either half copies
+// only that fragment. Here we capture the pane in two ways:
+//   - capture-pane -p   → visual lines (what the user sees)
+//   - capture-pane -J -p → logical lines with wrap collapsed
+// We extract every URL from the logical view, then check which one
+// has a substring on the clicked visual row. The matched URL is the
+// full thing, regardless of how many rows it wrapped across.
+function clickUrlAtPane(paneId, yStr) {
+  const Y = parseInt(yStr, 10);
+  if (!paneId || !Number.isFinite(Y)) return;
+  const visualRes = spawnSync('tmux', ['capture-pane', '-p', '-t', paneId], { encoding: 'utf8' });
+  const logicalRes = spawnSync('tmux', ['capture-pane', '-J', '-p', '-t', paneId], { encoding: 'utf8' });
+  if (visualRes.status !== 0 || logicalRes.status !== 0) {
+    logClick(`url capture-fail pane=${paneId} y=${Y}`); return;
+  }
+  // URL regex: tolerant of common URL chars, stops at whitespace and a
+  // few obvious sentence terminators. Trailing punctuation (.,;:) is
+  // trimmed since URLs in prose often end with them.
+  const URL_RE = /https?:\/\/[^\s<>"'`{}|\\^]+/g;
+  const trimTrailing = u => u.replace(/[.,;:!?)\]]+$/, '');
+  const urls = Array.from(new Set(
+    [...logicalRes.stdout.matchAll(URL_RE)].map(m => trimTrailing(m[0]))
+  )).filter(u => u.length >= 8);
+  if (!urls.length) { logClick(`url no-urls-in-pane pane=${paneId} y=${Y}`); return; }
+  const lines = visualRes.stdout.split('\n');
+  const lineY = lines[Y] || '';
+  if (!lineY) { logClick(`url empty-line pane=${paneId} y=${Y}`); return; }
+  // Find the URL that has the longest substring overlap with the clicked
+  // visual row. Prefer full-string matches; fall back to longest prefix
+  // (URL was wrapped — the head sits on this row) or longest suffix
+  // (the tail sits on this row).
+  let best = null, bestLen = 0;
+  for (const url of urls) {
+    if (lineY.includes(url) && url.length > bestLen) { best = url; bestLen = url.length; continue; }
+    for (let len = Math.min(url.length, lineY.length); len >= 8; len--) {
+      const pre = url.slice(0, len);
+      if (lineY.includes(pre)) { if (url.length > bestLen) { best = url; bestLen = url.length; } break; }
+      const suf = url.slice(-len);
+      if (lineY.includes(suf)) { if (url.length > bestLen) { best = url; bestLen = url.length; } break; }
+    }
+  }
+  if (!best) { logClick(`url no-match pane=${paneId} y=${Y} line="${lineY.slice(0, 80)}"`); return; }
+  logClick(`url launch pane=${paneId} y=${Y} url=${best.slice(0, 200)}`);
+  if (which('xdg-open')) {
+    spawnSync('xdg-open', [best], { detached: true, stdio: 'ignore' });
+  }
+  // Also stash on the clipboard — if xdg-open is missing or the URL
+  // routes to the wrong handler, the user can still paste it.
+  if (which('wl-copy')) {
+    spawnSync('wl-copy', [], { input: best,
+      env: { ...process.env,
+             XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`,
+             WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY || 'wayland-0' } });
+  }
+}
+
+// ----- right-top: multi-agent task overlay -----
+//
+// Renders the active agent's task/plan list to the pane. Multiple
+// coding agents are supported — each writes tasks in its own format
+// and location, so we probe every known source and pick whichever
+// one has the freshest mtime AND non-empty content. That way the
+// pane tracks whichever agent the user is actually driving in this
+// project, not just Claude.
+//
+// Source map (newer mtime wins):
+//   1. Claude Code   — ~/.claude/tasks/<session>/<n>.json
+//                      (global newest session; Claude doesn't bind
+//                      sessions to cwd so we trust mtime)
+//   2. opencode      — ~/.config/opencode/tasks/<basename(cwd)>/T-*.json
+//   3. omx (codex)   — <cwd>/.omx/state/sessions/<newest>/ralph-state.json
+//                      (completion_audit.prompt_to_artifact_checklist
+//                      or implemented[])
+//   4. TODO.md       — <cwd>/{TODO,TASKS,ROADMAP}.md (markdown
+//                      checkboxes)
+// Each source returns { source, tasks[], mtime }. Updates every 2s,
+// alt-screen so wheel-scroll won't expose stale frames, read-only.
+const CLAUDE_PROJECTS_DIR = path.join(HOME, '.claude', 'projects');
+const OPENCODE_TASKS_DIR = path.join(HOME, '.config', 'opencode', 'tasks');
+const TASK_OVERLAY_TICK_MS = 2000;
+
+// Encode a cwd the way Claude Code names its project slugs: any `/`
+// or `.` becomes `-`. Anchor with a leading `-` so it matches the
+// directory naming on disk (e.g. /home/user/projects/example →
+// -home-cheol-projects-jikji).
+function claudeSlugFor(cwd) {
+  if (!cwd) return null;
+  return cwd.replace(/[\/.]/g, '-');
+}
+
+function safeStat(p) {
+  try { return fs.statSync(p); } catch { return null; }
+}
+function safeReaddir(p) {
+  try { return fs.readdirSync(p); } catch { return []; }
+}
+function newestEntry(parent) {
+  const entries = safeReaddir(parent)
+    .map(name => {
+      const st = safeStat(path.join(parent, name));
+      return st ? { name, mtime: st.mtimeMs } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.mtime - a.mtime);
+  return entries[0] || null;
+}
+
+// --- Claude source ---
+// Claude Code 2.x stores tasks inline in the session JSONL
+// transcript at ~/.claude/projects/<slug>/<session>.jsonl. Each
+// TaskCreate emits a tool_result whose `toolUseResult.task` carries
+// {id, subject}; subsequent TaskUpdate calls carry {taskId, status}
+// in their input. We scan the file for both patterns to reconstruct
+// the current task list. Per-cwd: prefer the slug matching the pane
+// directory, fall back to the most-recently-modified jsonl across
+// all projects (covers the case where the pane is in a subdir of
+// where claude was launched).
+const _claudeJsonlCache = new Map(); // path → { size, tasks }
+function parseClaudeJsonl(filePath, stat) {
+  const cached = _claudeJsonlCache.get(filePath);
+  if (cached && cached.size === stat.size) return cached.tasks;
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return []; }
+  // Two regex passes — task creations seed the map, then updates
+  // mutate status. JSONL is append-only so textual order is
+  // chronological.
+  const tasks = new Map();
+  const createRe = /"toolUseResult":\{"task":\{"id":"([^"]+)","subject":"((?:[^"\\]|\\.)*)"/g;
+  let m;
+  while ((m = createRe.exec(text)) !== null) {
+    let subject;
+    try { subject = JSON.parse('"' + m[2] + '"'); } catch { subject = m[2]; }
+    tasks.set(m[1], { id: m[1], subject, status: 'pending' });
+  }
+  const updateRe = /"name":"TaskUpdate","input":\{[^}]+\}/g;
+  while ((m = updateRe.exec(text)) !== null) {
+    const block = m[0];
+    const idMatch = /"taskId":"([^"]+)"/.exec(block);
+    const stMatch = /"status":"([^"]+)"/.exec(block);
+    if (idMatch && stMatch && tasks.has(idMatch[1])) {
+      tasks.get(idMatch[1]).status = stMatch[1];
+    }
+  }
+  const list = Array.from(tasks.values()).sort((a, b) => {
+    const an = Number(a.id), bn = Number(b.id);
+    if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
+    return a.id.localeCompare(b.id);
+  });
+  _claudeJsonlCache.set(filePath, { size: stat.size, tasks: list });
+  return list;
+}
+
+function readClaudeSource(cwd, excl) {
+  // Project-scoped: only look at JSONLs whose slug matches this
+  // pane's cwd. Globbing across all slugs would let one busy session
+  // (e.g. claude launched in /home/user/projects) hijack every
+  // project pane.
+  //
+  // Parent-dir fallback: claude is often launched one or two levels
+  // above the project root (e.g. /home/user/projects covers many
+  // sub-projects). Walk up to HOME, stopping early. To avoid the
+  // hijack problem, parent-dir JSONLs only count if their tasks
+  // actually run in cwd — we check by streaming a recent slice for
+  // a "cwd":"<cwd>" needle, and only accept if matched.
+  if (!cwd) return null;
+  const probeDirs = [cwd];
+  let p = path.dirname(cwd);
+  // Walk up at most 3 parents (cwd, parent, grandparent, ggparent).
+  for (let i = 0; i < 3 && p && p !== '/' && p !== HOME; i++) {
+    probeDirs.push(p);
+    p = path.dirname(p);
+  }
+  const seen = new Set();
+  for (let idx = 0; idx < probeDirs.length; idx++) {
+    const probeCwd = probeDirs[idx];
+    const slug = claudeSlugFor(probeCwd);
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    const dir = path.join(CLAUDE_PROJECTS_DIR, slug);
+    const candidates = [];
+    for (const f of safeReaddir(dir)) {
+      if (!/\.jsonl$/.test(f)) continue;
+      const fp = path.join(dir, f);
+      const st = safeStat(fp);
+      if (st) candidates.push({ path: fp, mtime: st.mtimeMs, stat: st });
+    }
+    if (!candidates.length) continue;
+    candidates.sort((a, b) => b.mtime - a.mtime);
+    for (const c of candidates) {
+      // Skip jsonls held open by the sub pane: those are another
+      // agent's session, not ours.
+      if (excl && excl.paths && excl.paths.has(c.path)) continue;
+      // Parent slugs must prove relevance: at least one recent event
+      // in the file must report cwd == pane cwd. Otherwise we'd pull
+      // unrelated subprojects' tasks into this pane.
+      if (idx > 0 && !jsonlMentionsCwd(c.path, cwd)) continue;
+      const tasks = parseClaudeJsonl(c.path, c.stat);
+      if (tasks.length) {
+        const sessionId = path.basename(c.path, '.jsonl');
+        return {
+          source: `Claude · ${sessionId.slice(0, 8)}`,
+          tasks,
+          mtime: c.mtime,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// Cheap relevance check: read only the tail of the JSONL (last
+// ~200KB is plenty for any recent activity) and look for the cwd
+// literal. Avoids loading 50MB transcripts just to discover the
+// session isn't actually working in this dir.
+function jsonlMentionsCwd(filePath, cwd) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const st = fs.fstatSync(fd);
+      const TAIL = 200 * 1024;
+      const len = Math.min(TAIL, st.size);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, Math.max(0, st.size - len));
+      const needle = `"cwd":"${cwd}"`;
+      return buf.indexOf(needle) !== -1;
+    } finally { fs.closeSync(fd); }
+  } catch { return false; }
+}
+
+// --- opencode source ---
+// opencode stores per-project task json under
+// ~/.config/opencode/tasks/<project>/T-*.json. The project key is
+// the basename of cwd, so multi-project users get isolated lists.
+function readOpencodeSource(cwd, excl) {
+  if (!cwd) return null;
+  // Sub-pane opencode running in this cwd shares the same per-project
+  // task dir (keyed by basename), so silence the source rather than
+  // try to disambiguate per-file.
+  if (excl && excl.opencodeCwds && excl.opencodeCwds.has(cwd)) return null;
+  const key = path.basename(cwd);
+  if (!key) return null;
+  const dir = path.join(OPENCODE_TASKS_DIR, key);
+  const files = safeReaddir(dir).filter(f => /^T-.+\.json$/.test(f));
+  if (!files.length) return null;
+  const items = [];
+  let mtime = 0;
+  for (const f of files) {
+    const fp = path.join(dir, f);
+    if (excl && excl.paths && excl.paths.has(fp)) continue;
+    const st = safeStat(fp);
+    if (st && st.mtimeMs > mtime) mtime = st.mtimeMs;
+    try {
+      const j = JSON.parse(fs.readFileSync(fp, 'utf8'));
+      if (j && j.subject) items.push({
+        status: j.status || 'pending',
+        subject: j.subject,
+        _mtime: st ? st.mtimeMs : 0,
+      });
+    } catch {}
+  }
+  if (!items.length) return null;
+  // opencode task files are immutable per-id; show in chronological
+  // creation order so the user sees the plan as it was assembled.
+  items.sort((a, b) => a._mtime - b._mtime);
+  return { source: `opencode · ${key}`, tasks: items, mtime };
+}
+
+// --- codex source ---
+// codex (openai/codex) writes a session rollout to
+// ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl. The first line is a
+// session_meta with {cwd}. Every plan update is a function_call with
+// name="update_plan" and arguments containing {plan:[{step,status}]}.
+// The latest update_plan completely replaces the prior one, so we
+// only need the last occurrence to render the current state.
+const CODEX_SESSIONS_DIR = path.join(HOME, '.codex', 'sessions');
+const CODEX_ROLLOUT_AGE_MS = 24 * 3600 * 1000; // ignore rollouts older than a day
+const _codexRolloutCache = new Map(); // path → { size, plan, plannedAt }
+
+function codexFirstLineCwd(filePath) {
+  try {
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(8192);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      const head = buf.slice(0, n).toString('utf8');
+      const nl = head.indexOf('\n');
+      const line = nl === -1 ? head : head.slice(0, nl);
+      const j = JSON.parse(line);
+      return j?.payload?.cwd || null;
+    } finally { fs.closeSync(fd); }
+  } catch { return null; }
+}
+
+function parseCodexPlan(filePath, stat) {
+  const cached = _codexRolloutCache.get(filePath);
+  if (cached && cached.size === stat.size) return cached;
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return null; }
+  // Merge EVERY update_plan call rather than only the last one.
+  // codex rewrites the plan in full on each tick, so steps that
+  // were already completed sometimes disappear from later plans —
+  // without merging we'd lose history. Each plan entry is preceded
+  // by its rollout timestamp, so we can pair them by walking
+  // sequentially.
+  const lineRe = /\{"timestamp":"([^"]+)"[^\n]*?"name":"update_plan","arguments":"((?:[^"\\]|\\.)*?)"[^\n]*\}/g;
+  const merged = new Map(); // step text → { status, firstSeen, lastSeen, statusChangedAt, order }
+  let order = 0;
+  let m;
+  while ((m = lineRe.exec(text)) !== null) {
+    const ts = m[1];
+    let parsed;
+    try {
+      const argStr = JSON.parse('"' + m[2] + '"');
+      parsed = JSON.parse(argStr);
+    } catch { continue; }
+    if (!parsed || !Array.isArray(parsed.plan)) continue;
+    for (const p of parsed.plan) {
+      const subject = String(p.step || p.subject || '').trim();
+      if (!subject) continue;
+      const status = p.status === 'completed' ? 'completed'
+                   : p.status === 'in_progress' ? 'in_progress'
+                   : p.status === 'failed' ? 'failed' : 'pending';
+      const prev = merged.get(subject);
+      if (!prev) {
+        merged.set(subject, {
+          subject, status,
+          firstSeen: ts, lastSeen: ts,
+          statusChangedAt: ts,
+          order: order++,
+        });
+      } else {
+        const statusChanged = prev.status !== status;
+        prev.lastSeen = ts;
+        if (statusChanged) {
+          prev.status = status;
+          prev.statusChangedAt = ts;
+        }
+      }
+    }
+  }
+  if (!merged.size) {
+    _codexRolloutCache.set(filePath, { size: stat.size, plan: null });
+    return null;
+  }
+  const tasks = Array.from(merged.values());
+  const entry = { size: stat.size, plan: tasks };
+  _codexRolloutCache.set(filePath, entry);
+  return entry;
+}
+
+function readCodexSource(cwd, excl) {
+  if (!cwd) return null;
+  const candidates = [];
+  const now = Date.now();
+  // walk YYYY/MM/DD/ — only a few levels deep; only files modified
+  // within the last day to avoid scanning months of rollouts.
+  for (const yr of safeReaddir(CODEX_SESSIONS_DIR)) {
+    const yrDir = path.join(CODEX_SESSIONS_DIR, yr);
+    for (const mo of safeReaddir(yrDir)) {
+      const moDir = path.join(yrDir, mo);
+      for (const dy of safeReaddir(moDir)) {
+        const dyDir = path.join(moDir, dy);
+        for (const f of safeReaddir(dyDir)) {
+          if (!/^rollout-.+\.jsonl$/.test(f)) continue;
+          const fp = path.join(dyDir, f);
+          const st = safeStat(fp);
+          if (!st) continue;
+          if (now - st.mtimeMs > CODEX_ROLLOUT_AGE_MS) continue;
+          candidates.push({ path: fp, mtime: st.mtimeMs, stat: st });
+        }
+      }
+    }
+  }
+  // Pre-filter by first-line cwd. Cache the cwd lookup by path: it
+  // never changes after the file is created, so this is cheap.
+  const matching = [];
+  for (const c of candidates) {
+    let rcwd = _codexCwdCache.get(c.path);
+    if (rcwd === undefined) {
+      rcwd = codexFirstLineCwd(c.path);
+      _codexCwdCache.set(c.path, rcwd);
+    }
+    if (rcwd === cwd) matching.push(c);
+  }
+  // Drop any rollout currently held open by the sub pane.
+  const filtered = matching.filter(c => !(excl && excl.paths && excl.paths.has(c.path)));
+  if (!filtered.length) return null;
+  filtered.sort((a, b) => b.mtime - a.mtime);
+  const pick = filtered[0];
+  const parsed = parseCodexPlan(pick.path, pick.stat);
+  if (!parsed || !parsed.plan || !parsed.plan.length) return null;
+  const sid = path.basename(pick.path).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
+  // sid looks like "2026-05-23T11-27-40-<uuid>"; show the date stamp.
+  const label = sid.slice(0, 19).replace(/-/g, (c, i) => i < 10 ? '-' : (i === 13 || i === 16 ? ':' : '-'));
+  return {
+    source: `codex · ${label}`,
+    tasks: parsed.plan,
+    mtime: pick.mtime,
+  };
+}
+const _codexCwdCache = new Map();
+
+// --- omx (oh-my-codex) source ---
+// omx doesn't track discrete tasks during a run; the closest thing
+// is the latest ralph-state.json in <cwd>/.omx/state/sessions/. It
+// has `completion_audit.prompt_to_artifact_checklist[]` (post-run
+// requirements + status) and `implemented[]` (free-text done list).
+// We synthesize a task list from those, marking implemented items
+// as completed. If the run is mid-flight (active=true) and there's
+// no checklist yet, return null so a fresher source can take over.
+function readOmxSource(cwd, excl) {
+  if (!cwd) return null;
+  // If the sub pane is running omx in this same cwd, suppress the
+  // omx source entirely — its state file would otherwise win the
+  // freshness race and the sub's progress would leak into status.
+  if (excl && excl.omxCwds && excl.omxCwds.has(cwd)) return null;
+  const sessionsDir = path.join(cwd, '.omx', 'state', 'sessions');
+  const newest = newestEntry(sessionsDir);
+  if (!newest) return null;
+  const sessionDir = path.join(sessionsDir, newest.name);
+  const ralphPath = path.join(sessionDir, 'ralph-state.json');
+  if (excl && excl.paths && excl.paths.has(ralphPath)) return null;
+  const st = safeStat(ralphPath);
+  if (!st) return null;
+  let j;
+  try { j = JSON.parse(fs.readFileSync(ralphPath, 'utf8')); } catch { return null; }
+  const tasks = [];
+  const checklist = j?.completion_audit?.prompt_to_artifact_checklist;
+  if (Array.isArray(checklist)) {
+    for (const c of checklist) {
+      if (typeof c === 'string') {
+        // arrow-style "requirement -> artifact"; keep the requirement
+        const sub = c.split('->')[0].trim() || c;
+        tasks.push({ status: 'completed', subject: sub });
+      } else if (c && typeof c === 'object' && c.requirement) {
+        tasks.push({
+          status: c.status === 'passed' ? 'completed'
+                 : c.status === 'failed' ? 'failed' : 'pending',
+          subject: String(c.requirement),
+        });
+      }
+    }
+  }
+  if (!tasks.length && Array.isArray(j.implemented)) {
+    for (const s of j.implemented) tasks.push({ status: 'completed', subject: String(s) });
+  }
+  if (j.fix && typeof j.fix === 'string') {
+    tasks.push({ status: 'completed', subject: 'fix: ' + j.fix });
+  }
+  if (!tasks.length) return null;
+  const label = j.release ? `omx · ${newest.name.slice(0, 14)} · ${j.release}`
+                          : `omx · ${newest.name.slice(0, 14)}`;
+  return { source: label, tasks, mtime: st.mtimeMs };
+}
+
+// --- TODO.md fallback ---
+// Markdown checkbox idiom: "- [ ] foo" pending, "- [x] foo" done,
+// "- [-] foo" / "- [/] foo" in-progress (extension some projects
+// use). The first file found in TODO_CANDIDATES wins.
+const TODO_CANDIDATES = [
+  'TODO.md', 'TASKS.md', 'ROADMAP.md', 'TODO', 'TODOS.md',
+  'todo.md', 'tasks.md', '.todo', 'docs/TODO.md', 'docs/TASKS.md',
+];
+function readTodoSource(cwd) {
+  if (!cwd) return null;
+  for (const name of TODO_CANDIDATES) {
+    const fp = path.join(cwd, name);
+    const st = safeStat(fp);
+    if (!st) continue;
+    let text;
+    try { text = fs.readFileSync(fp, 'utf8'); } catch { continue; }
+    const re = /^\s*[-*+]\s+\[([ xX/\-])\]\s+(.+)$/gm;
+    const tasks = [];
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const mark = m[1].toLowerCase();
+      const status = mark === 'x' ? 'completed'
+                   : (mark === '-' || mark === '/') ? 'in_progress'
+                   : 'pending';
+      tasks.push({ status, subject: m[2].trim() });
+    }
+    if (tasks.length) return { source: name, tasks, mtime: st.mtimeMs };
+  }
+  return null;
+}
+
+// Walk the sub pane's process tree and collect any open file paths
+// that look like agent session storage. Anything an agent in the sub
+// pane has open is implicitly *not* the main pane's work — we exclude
+// these paths from the source pickers so sub-pane activity can never
+// pollute the status overlay.
+//
+// For omx/opencode the agent doesn't keep a single session file open
+// (it writes and closes), so fd inspection misses them. We also
+// detect the agent by cmdline and tag its cwd; the source readers
+// then check those cwd tags before returning.
+//
+// Returns { paths: Set<string>, omxCwds: Set<string>, opencodeCwds: Set<string> }.
+function collectSubPaneSessions(statusPaneId) {
+  const empty = { paths: new Set(), omxCwds: new Set(), opencodeCwds: new Set() };
+  if (!statusPaneId) return empty;
+  const winOut = spawnSync('tmux', ['display-message', '-p', '-t', statusPaneId,
+    '#{session_name}:#{window_index}'], { encoding: 'utf8' });
+  if (winOut.status !== 0) return empty;
+  const winTarget = winOut.stdout.trim();
+  const ls = spawnSync('tmux', ['list-panes', '-t', winTarget,
+    '-F', '#{pane_id}\t#{pane_title}\t#{pane_pid}'], { encoding: 'utf8' });
+  if (ls.status !== 0) return empty;
+  const subRoots = [];
+  for (const line of ls.stdout.trim().split('\n')) {
+    const parts = line.split('\t');
+    if (parts.length !== 3) continue;
+    const [, title, panePid] = parts;
+    if (paneRoleOf(title) !== 'sub') continue;
+    const n = parseInt(panePid, 10);
+    if (Number.isFinite(n)) subRoots.push(n);
+  }
+  if (!subRoots.length) return empty;
+  const out = { paths: new Set(), omxCwds: new Set(), opencodeCwds: new Set() };
+  for (const rootPid of subRoots) walkSubPaneTree(rootPid, out);
+  return out;
+}
+
+function walkSubPaneTree(rootPid, out) {
+  const visited = new Set();
+  const stack = [rootPid];
+  let safety = 256;
+  while (stack.length && safety-- > 0) {
+    const pid = stack.pop();
+    if (visited.has(pid)) continue;
+    visited.add(pid);
+    // Enqueue children
+    try {
+      const taskDirs = fs.readdirSync(`/proc/${pid}/task`);
+      for (const tid of taskDirs) {
+        let kids;
+        try { kids = fs.readFileSync(`/proc/${pid}/task/${tid}/children`, 'utf8'); }
+        catch { continue; }
+        for (const k of kids.trim().split(/\s+/)) {
+          const kpid = parseInt(k, 10);
+          if (Number.isFinite(kpid) && !visited.has(kpid)) stack.push(kpid);
+        }
+      }
+    } catch { /* pid gone */ continue; }
+    // Inspect open fds for known agent session files
+    let fds = null;
+    try { fds = fs.readdirSync(`/proc/${pid}/fd`); } catch {}
+    if (fds) {
+      for (const fd of fds) {
+        let tgt;
+        try { tgt = fs.readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { continue; }
+        if (!tgt) continue;
+        if (tgt.includes('/.claude/projects/') && tgt.endsWith('.jsonl')) out.paths.add(tgt);
+        else if (tgt.includes('/.codex/sessions/') && tgt.endsWith('.jsonl')) out.paths.add(tgt);
+        else if (tgt.includes('/.omx/state/sessions/') && tgt.endsWith('ralph-state.json')) out.paths.add(tgt);
+        else if (tgt.includes('/.config/opencode/tasks/') && /\/T-.+\.json$/.test(tgt)) out.paths.add(tgt);
+      }
+    }
+    // Identify omx/opencode by cmdline so we can exclude their cwd
+    // even when they aren't holding the session file open.
+    let cmd = '';
+    try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { continue; }
+    if (!cmd) continue;
+    const args = cmd.split('\0').filter(Boolean);
+    let kind = null;
+    for (const a of args) {
+      const base = a.split('/').pop();
+      if (base === 'omx' || a.endsWith('/oh-my-codex') || a.includes('oh-my-codex/')) { kind = 'omx'; break; }
+      if (base === 'opencode' || a.endsWith('/opencode')) { kind = 'opencode'; break; }
+    }
+    if (!kind) continue;
+    let cwdp = null;
+    try { cwdp = fs.readlinkSync(`/proc/${pid}/cwd`); } catch {}
+    if (!cwdp) continue;
+    if (kind === 'omx') out.omxCwds.add(cwdp);
+    else if (kind === 'opencode') out.opencodeCwds.add(cwdp);
+  }
+}
+
+// Probe every source and pick the freshest non-empty one. mtime
+// alone is the tiebreaker — whatever agent has been writing most
+// recently wins the pane. excl carries the sub-pane sessions to
+// exclude so sub-pane activity never bleeds into the status overlay.
+function pickActiveTaskSource(cwd, excl) {
+  const probes = [
+    readClaudeSource(cwd, excl),
+    readCodexSource(cwd, excl),
+    readOpencodeSource(cwd, excl),
+    readOmxSource(cwd, excl),
+    readTodoSource(cwd),
+  ].filter(s => s && s.tasks && s.tasks.length);
+  if (!probes.length) return null;
+  probes.sort((a, b) => b.mtime - a.mtime);
+  return probes[0];
+}
+
+function paintAltScreen(body) {
+  // Synced update + cursor home + clear-from-cursor-down (wipes
+  // the previous frame), then write the body. We deliberately do
+  // NOT emit a trailing newline after the body — when body line
+  // count equals pane height the trailing \n triggers a scroll
+  // that pushes the top row off-screen.
+  return '\x1b[?2026h\x1b[H\x1b[J' + body + '\x1b[?2026l';
+}
+
+// Per-pane event queue. tmux bindings on the right-top pane append
+// "SCROLL UP" / "SCROLL DOWN" / "CLICK <y>" lines here; the running
+// daemon polls the file each tick and applies them. Using a file
+// instead of signals lets us carry parameters (which row was clicked,
+// which direction) cleanly.
+const TASK_EVENT_DIR = path.join(CONFIG_DIR, 'task-events');
+function taskEventFile(paneId) {
+  return path.join(TASK_EVENT_DIR, paneId.replace(/[^A-Za-z0-9_-]/g, '_') + '.queue');
+}
+
+// One row in the rendered overlay → which task it represents.
+// Persisted to disk so the click handler (which runs as a separate
+// nmux-linux process) can read it.
+function taskRowmapFile(paneId) {
+  return path.join(TASK_EVENT_DIR, paneId.replace(/[^A-Za-z0-9_-]/g, '_') + '.rowmap.json');
+}
+
+function appendTaskEvent(paneId, event) {
+  try {
+    fs.mkdirSync(TASK_EVENT_DIR, { recursive: true });
+    fs.appendFileSync(taskEventFile(paneId), event + '\n');
+  } catch {}
+}
+
+function readAndClearTaskEvents(paneId) {
+  const fp = taskEventFile(paneId);
+  let text;
+  try { text = fs.readFileSync(fp, 'utf8'); } catch { return []; }
+  try { fs.writeFileSync(fp, ''); } catch {}
+  return text.split('\n').map(s => s.trim()).filter(Boolean);
+}
+
+// Resolve the "main coding pane" for a given window. Layout is
+// sidebar | main | code-mid | right-top/right-bot, so the main is
+// the pane whose title isn't reserved and which sits leftmost (after
+// the sidebar). We pick by smallest pane_left coordinate.
+function findMainPaneInWindow(windowTarget) {
+  const out = spawnSync('tmux', ['list-panes', '-t', windowTarget,
+    '-F', '#{pane_id}\t#{pane_title}\t#{pane_left}'], { encoding: 'utf8' });
+  if (out.status !== 0) return null;
+  const candidates = out.stdout.trim().split('\n')
+    .map(l => l.split('\t'))
+    .filter(p => p.length === 3 && !RESERVED_PANE_TITLES.has(p[1]))
+    .map(([id, title, left]) => ({ id, title, left: parseInt(left, 10) }))
+    .sort((a, b) => a.left - b.left);
+  return candidates[0]?.id || null;
+}
+
+// Click on a status row should surface the corresponding task in
+// the main pane. Two regimes:
+//
+//   - Main pane runs a TUI agent (claude/codex) on the alternate
+//     screen. tmux's scrollback only captures the *primary* buffer,
+//     so search-backward can never see the agent's view. For these
+//     panes we open a tmux popup that surfaces the task text
+//     directly, since the agent owns the screen.
+//
+//   - Main pane runs a normal shell with scrolling output (omx logs,
+//     bash, etc). copy-mode + search-backward lands on the task
+//     subject in the scrollback, which is what the user wants.
+//
+// We pick the regime by checking #{alternate_on} on the main pane.
+function jumpMainPaneToTask(paneId, subject) {
+  // Find the window that owns the right-top daemon pane.
+  const winOut = spawnSync('tmux', ['display-message', '-p', '-t', paneId,
+    '#{session_name}:#{window_index}'], { encoding: 'utf8' });
+  if (winOut.status !== 0) return;
+  const winTarget = winOut.stdout.trim();
+  const mainPane = findMainPaneInWindow(winTarget);
+  if (!mainPane) return;
+  const altOut = spawnSync('tmux', ['display-message', '-p', '-t', mainPane,
+    '#{alternate_on}'], { encoding: 'utf8' });
+  const isAlt = altOut.status === 0 && altOut.stdout.trim() === '1';
+  if (isAlt) {
+    showTaskPopup(subject);
+    return;
+  }
+  // Trim the subject to a reasonable search snippet — long Korean
+  // sentences can include punctuation that tmux search treats
+  // literally; keep the first ~40 chars to maximize hit rate.
+  const snippet = String(subject).replace(/\s+/g, ' ').trim().slice(0, 40);
+  if (!snippet) return;
+  spawnSync('tmux', ['copy-mode', '-t', mainPane], { stdio: 'ignore' });
+  spawnSync('tmux', ['send-keys', '-t', mainPane, '-X', 'search-backward', snippet],
+    { stdio: 'ignore' });
+}
+
+// Pop a modal with the task subject. -E runs the command and closes
+// the popup when it exits; `read -n 1` waits for any single keypress
+// so the user can read at their pace. Detached so the daemon's tick
+// loop keeps running while the popup is up.
+function showTaskPopup(subject) {
+  const body = String(subject || '').replace(/\r/g, '');
+  const cmd =
+    `printf '\\033[1;36m  Task\\033[0m\\n\\n  %s\\n\\n\\033[2m  (main pane이 TUI 모드라 scroll-jump 불가 — 아무 키나 눌러 닫기)\\033[0m\\n' ${shQuote(body)};` +
+    ` read -n 1 -s _`;
+  const child = spawn('tmux',
+    ['display-popup', '-E', '-w', '70%', '-h', '30%', '-S', 'fg=colour39',
+     'bash', '-lc', cmd],
+    { detached: true, stdio: 'ignore' });
+  child.unref();
+}
+
+function taskOverlayDaemon(cwd) {
+  cwd = cwd || process.env.PWD || process.cwd();
+  const paneId = process.env.TMUX_PANE || '';
+  // Per-pane clear-history so wheel-scroll on this pane shows the
+  // current frame, not earlier paints. Same trick as the sidebar.
+  if (paneId) {
+    spawnSync('tmux', ['clear-history', '-t', paneId], { stdio: 'ignore' });
+  }
+  // Wipe any leftover events from a previous daemon instance so we
+  // don't replay stale scroll/click on startup.
+  if (paneId) {
+    try { fs.mkdirSync(TASK_EVENT_DIR, { recursive: true }); } catch {}
+    try { fs.writeFileSync(taskEventFile(paneId), ''); } catch {}
+  }
+  process.stdout.write('\x1b[?1049h');
+  let lastBody = null;
+  let viewportBottom = -1;       // index of last-rendered task; -1 = follow latest
+  let autoFollow = true;         // if true, viewport sticks to the newest task
+  let lastSortedRef = null;      // last rendered list (for click resolution)
+
+  function applyEvents() {
+    if (!paneId) return;
+    const events = readAndClearTaskEvents(paneId);
+    if (!events.length) return;
+    for (const e of events) {
+      if (e === 'SCROLL UP') {
+        // see older — viewport bottom moves up by 1
+        autoFollow = false;
+        if (viewportBottom > 0) viewportBottom--;
+      } else if (e === 'SCROLL DOWN') {
+        // see newer — viewport bottom moves down by 1; re-engage
+        // follow-mode when we reach the latest item.
+        viewportBottom++;
+      } else if (e === 'SCROLL TOP') {
+        autoFollow = false;
+        viewportBottom = 0;
+      } else if (e === 'SCROLL BOTTOM') {
+        autoFollow = true;
+        viewportBottom = -1;
+      } else if (e.startsWith('CLICK ')) {
+        const y = parseInt(e.slice(6), 10);
+        if (Number.isFinite(y) && lastSortedRef && lastSortedRef.rowMap) {
+          const subject = lastSortedRef.rowMap.get(y);
+          if (subject) jumpMainPaneToTask(paneId, subject);
+        }
+      }
+    }
+  }
+
+  function render() {
+    const w = process.stdout.columns || 60;
+    // Walk the sub pane's process tree each tick and feed the open
+    // agent files / claimed cwds to the source pickers as an exclude
+    // set. This is the guarantee that whatever the user runs in the
+    // sub pane stays out of the status overlay.
+    const excl = collectSubPaneSessions(paneId);
+    const picked = pickActiveTaskSource(cwd, excl);
+    const tasks = picked ? picked.tasks : [];
+    const sourceLabel = picked ? picked.source : '(no source)';
+    const lines = [];
+    lines.push('\x1b[1;38;5;39m  tasks\x1b[0m  \x1b[2m· ' + sourceLabel + '\x1b[0m');
+    lines.push('\x1b[2m' + '─'.repeat(Math.min(w - 1, 60)) + '\x1b[0m');
+    if (!tasks.length) {
+      lines.push(' \x1b[2m(no active tasks — Claude/opencode/omx or TODO.md)\x1b[0m');
+    } else {
+      // Two-bucket stack: completed [x] above, todo [ ] below.
+      // Within each bucket, oldest at top → newest at bottom. This
+      // matches the agent's working pattern (codex rewrites the
+      // plan on each tick, so freshly-added items often appear with
+      // pre-existing completed ones — separating by status keeps
+      // the visual unambiguous).
+      let done = 0, todo = 0;
+      for (const t of tasks) {
+        if (t.status === 'completed') done++; else todo++;
+      }
+      lines.push(` \x1b[32m[x] ${done}\x1b[0m   \x1b[2m[ ] ${todo}\x1b[0m   \x1b[2m(${done}/${tasks.length})\x1b[0m`);
+      lines.push('');
+      const completed = tasks.filter(t => t.status === 'completed');
+      const open = tasks.filter(t => t.status !== 'completed');
+      const tsOf = t => t.statusChangedAt || t.lastSeen || '';
+      completed.sort((a, b) => {
+        const at = tsOf(a), bt = tsOf(b);
+        if (at && bt && at !== bt) return at < bt ? -1 : 1;
+        return (a.order ?? 0) - (b.order ?? 0);
+      });
+      open.sort((a, b) => {
+        // open items don't have a meaningful statusChangedAt — they
+        // never transitioned — so fall back to first-seen order.
+        const at = a.firstSeen || '', bt = b.firstSeen || '';
+        if (at && bt && at !== bt) return at < bt ? -1 : 1;
+        return (a.order ?? 0) - (b.order ?? 0);
+      });
+      const ordered = completed.concat(open);
+      const h = process.stdout.rows || 24;
+      const reserveTop = 1, reserveBottom = 1;
+      const budget = Math.max(1, h - lines.length - reserveTop - reserveBottom);
+      // viewportBottom = index of the LAST task to render. Default
+      // is bottom-anchored (latest). When the user scrolls back to
+      // the bottom we re-engage auto-follow so future task additions
+      // stay visible automatically.
+      if (viewportBottom < 0 || autoFollow) {
+        viewportBottom = ordered.length - 1;
+      }
+      if (viewportBottom >= ordered.length - 1) {
+        viewportBottom = ordered.length - 1;
+        autoFollow = true;
+      }
+      if (viewportBottom < budget - 1) viewportBottom = Math.min(ordered.length - 1, budget - 1);
+      const start = Math.max(0, viewportBottom - budget + 1);
+      const visible = ordered.slice(start, viewportBottom + 1);
+      const aboveCount = start;
+      const belowCount = ordered.length - 1 - viewportBottom;
+      // Top hint: hidden older items (scroll up to see).
+      if (aboveCount > 0) {
+        lines.push(`\x1b[2m   ↑ +${aboveCount} 이전 (wheel ↑)\x1b[0m`);
+      } else {
+        lines.push('');
+      }
+      const rowMap = new Map();
+      for (const t of visible) {
+        const checked = t.status === 'completed';
+        const icon = checked ? '\x1b[32m[x]\x1b[0m' : '\x1b[2m[ ]\x1b[0m';
+        const sub = String(t.subject || t.activeForm || '').replace(/\s+/g, ' ').trim();
+        const text = sub.slice(0, w - 6);
+        const style = checked ? '\x1b[2m' : '';
+        const close = style ? '\x1b[0m' : '';
+        const row1 = lines.length + 1;
+        rowMap.set(row1, sub);
+        lines.push(` ${icon} ${style}${text}${close}`);
+      }
+      if (belowCount > 0) {
+        lines.push(`\x1b[2m   ↓ +${belowCount} 최신 (wheel ↓)\x1b[0m`);
+      }
+      lastSortedRef = { rowMap };
+    }
+    const body = lines.map(l => l + '\x1b[K').join('\n');
+    if (body !== lastBody) {
+      process.stdout.write(paintAltScreen(body));
+      lastBody = body;
+    }
+  }
+  function tick() {
+    applyEvents();
+    render();
+  }
+  tick();
+  // Local performance patch: the old 200ms loop was too aggressive.
+  // It repeatedly walks process trees and task sources; with several open
+  // projects this saturated CPU and made Codex/OMX appear stuck at Working.
+  // Default to 3000ms; allow temporary override for debugging.
+  const TASK_OVERLAY_TICK_MS = Math.max(1000, Number(process.env.NMUX_TASK_OVERLAY_TICK_MS || 3000));
+  const timer = setInterval(tick, TASK_OVERLAY_TICK_MS);
+  function exit() {
+    try { process.stdout.write('\x1b[?1049l'); } catch {}
+    clearInterval(timer);
+    process.exit(0);
+  }
+  process.on('SIGTERM', exit);
+  process.on('SIGINT', exit);
+}
+
+// ----- right-bot: git status overlay -----
+//
+// Branch + ahead/behind + short status + last few commits. cwd is
+// passed in as --cwd by the buildLayout caller so the helper points
+// at the project root even when the pane was spawned from a deeper
+// directory.
+const GIT_OVERLAY_TICK_MS = 3000;
+
+function git(cwd, args) {
+  const r = spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8' });
+  return r.status === 0 ? r.stdout : '';
+}
+
+function gitOverlayDaemon(cwd) {
+  const dir = cwd || process.env.PWD || process.cwd() || HOME;
+  if (process.env.TMUX_PANE) {
+    spawnSync('tmux', ['clear-history', '-t', process.env.TMUX_PANE], { stdio: 'ignore' });
+  }
+  process.stdout.write('\x1b[?1049h');
+  let lastBody = null;
+  function render() {
+    const w = process.stdout.columns || 60;
+    const lines = [];
+    lines.push('\x1b[1;38;5;208m  git · ' + path.basename(dir) + '\x1b[0m');
+    lines.push('\x1b[2m' + '─'.repeat(Math.min(w - 1, 60)) + '\x1b[0m');
+    // Bail early if not a git repo.
+    const insideOut = spawnSync('git', ['-C', dir, 'rev-parse', '--is-inside-work-tree'],
+      { encoding: 'utf8' });
+    if (insideOut.status !== 0) {
+      lines.push(' \x1b[2m(not a git repository)\x1b[0m');
+    } else {
+      const branch = git(dir, ['symbolic-ref', '--short', 'HEAD']).trim() ||
+                     git(dir, ['rev-parse', '--short', 'HEAD']).trim();
+      const ahead = git(dir, ['rev-list', '--count', '@{u}..HEAD']).trim();
+      const behind = git(dir, ['rev-list', '--count', 'HEAD..@{u}']).trim();
+      let bline = ` \x1b[1;32m${branch || '(detached)'}\x1b[0m`;
+      if (ahead && ahead !== '0') bline += ` \x1b[36m↑${ahead}\x1b[0m`;
+      if (behind && behind !== '0') bline += ` \x1b[33m↓${behind}\x1b[0m`;
+      lines.push(bline);
+      const status = git(dir, ['status', '--short']).split('\n').filter(Boolean);
+      if (status.length) {
+        lines.push('');
+        lines.push(' \x1b[2mchanges\x1b[0m');
+        const SHOW = 14;
+        for (const s of status.slice(0, SHOW)) {
+          const code = s.slice(0, 2);
+          const file = s.slice(3);
+          let color = '\x1b[37m';
+          if (code.includes('?')) color = '\x1b[32m';
+          else if (code.includes('M')) color = '\x1b[33m';
+          else if (code.includes('A')) color = '\x1b[32m';
+          else if (code.includes('D')) color = '\x1b[31m';
+          else if (code.includes('R')) color = '\x1b[35m';
+          lines.push(` ${color}${code}\x1b[0m ${file.slice(0, w - 5)}`);
+        }
+        if (status.length > SHOW) {
+          lines.push(` \x1b[2m… +${status.length - SHOW} more\x1b[0m`);
+        }
+      } else {
+        lines.push(' \x1b[2mworking tree clean\x1b[0m');
+      }
+      const log = git(dir, ['log', '--oneline', '--decorate=no', '-5']).split('\n').filter(Boolean);
+      if (log.length) {
+        lines.push('');
+        lines.push(' \x1b[2mrecent\x1b[0m');
+        for (const l of log) {
+          const sp = l.indexOf(' ');
+          const hash = sp > 0 ? l.slice(0, sp) : l;
+          const msg = sp > 0 ? l.slice(sp + 1) : '';
+          lines.push(` \x1b[33m${hash}\x1b[0m \x1b[2m${msg.slice(0, w - 10)}\x1b[0m`);
+        }
+      }
+    }
+    const body = lines.map(l => l + '\x1b[K').join('\n');
+    if (body !== lastBody) {
+      process.stdout.write(paintAltScreen(body));
+      lastBody = body;
+    }
+  }
+  render();
+  const timer = setInterval(render, GIT_OVERLAY_TICK_MS);
+  function exit() {
+    try { process.stdout.write('\x1b[?1049l'); } catch {}
+    clearInterval(timer);
+    process.exit(0);
+  }
+  process.on('SIGTERM', exit);
+  process.on('SIGINT', exit);
+}
+
+// ----- agent watcher daemon -----
+//
+// Polls every nmux window's pane process trees and detects whether an
+// LLM agent (claude / codex / omx / gemini / aider) is currently alive
+// inside. The window's @nmuxlinux_status reflects that detection:
+//   agent appears      → "running"  (spinner)
+//   agent disappears   → "done"     (✓)
+//   user visits window → cleared back to "idle" by clear-status
+// This bypasses the brittle hook-based path entirely — a hook only
+// helps when the source tool fires one, runs in a TMUX-visible
+// process, and routes to the right project. The watcher inspects the
+// pane itself, so any agent in any window is seen consistently.
+
+const AGENT_BINS = new Set(['claude', 'codex', 'omx', 'gemini', 'aider', 'continue', 'cursor']);
+
+function looksLikeAgent(cmdline) {
+  const c = String(cmdline || '').replace(/\0/g, ' ').trim();
+  if (!c) return false;
+  const parts = c.split(/\s+/);
+  if (!parts.length) return false;
+  const arg0 = (parts[0] || '').split('/').pop();
+  if (AGENT_BINS.has(arg0)) return true;
+  // Node wrappers: `node /path/to/<agent>`
+  if (arg0 === 'node' && parts.length >= 2) {
+    const sub = (parts[1] || '').split('/').pop();
+    if (AGENT_BINS.has(sub)) return true;
+  }
+  return false;
+}
+
+function findAgentPidsInPane(rootPid, proc) {
+  const agents = [];
+  if (!rootPid) return agents;
+  const stack = [String(rootPid)];
+  const seen = new Set();
+  while (stack.length) {
+    const p = stack.pop();
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    if (looksLikeAgent(proc.commands.get(p))) agents.push(p);
+    for (const child of proc.children.get(p) || []) stack.push(child);
+  }
+  return agents;
+}
+
+// Read cumulative CPU ticks (utime + stime) for a pid. Process is gone
+// or unreadable → 0 (treated as "no activity recorded").
+function readCpuTicks(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // After "<comm>) " the remaining fields start at the 3rd character
+    // class (state); utime is field 14 (index 11), stime field 15 (12).
+    const tail = stat.split(') ').pop().split(' ');
+    const utime = parseInt(tail[11], 10) || 0;
+    const stime = parseInt(tail[12], 10) || 0;
+    return utime + stime;
+  } catch { return 0; }
+}
+
+const WATCHER_PID_FILE = path.join(CONFIG_DIR, 'watcher.pid');
+
+function watcherIsAlive() {
+  try {
+    if (!fs.existsSync(WATCHER_PID_FILE)) return false;
+    const pid = parseInt(fs.readFileSync(WATCHER_PID_FILE, 'utf8'), 10);
+    if (!Number.isFinite(pid)) return false;
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  } catch { return false; }
+}
+
+function startWatcherDaemonIfNeeded() {
+  if (watcherIsAlive()) return;
+  try { fs.unlinkSync(WATCHER_PID_FILE); } catch {}
+  const child = spawn(NMUX_BIN, ['watch-agents'],
+    { detached: true, stdio: 'ignore' });
+  child.unref();
+}
+
+function watchAgentsDaemon() {
+  // Single-instance: refuse to start if another watcher is already alive.
+  if (watcherIsAlive()) {
+    console.error('[nmux-linux] watcher already running');
+    process.exit(0);
+  }
+  ensureConfigDir();
+  fs.writeFileSync(WATCHER_PID_FILE, String(process.pid));
+  const cleanup = () => { try { fs.unlinkSync(WATCHER_PID_FILE); } catch {} };
+  process.on('exit', cleanup);
+  process.on('SIGTERM', () => { cleanup(); process.exit(0); });
+  process.on('SIGINT',  () => { cleanup(); process.exit(0); });
+
+  // Per-window "was active last tick" and per-pid CPU ticks at last
+  // sample. Active = at least one agent in this window burned more than
+  // CPU_ACTIVE_THRESHOLD ticks since the previous sample. Daemon-style
+  // agents like `omx resume` / `codex resume` stay alive while idle —
+  // process existence alone is not a useful signal, so we sample CPU
+  // delta over a TICK_MS window instead.
+  const prevQuietTicks = new Map();  // window_id -> consecutive idle ticks
+  const prevCpu = new Map();         // pid -> cumulative ticks
+  const prevPtyMtime = new Map();    // pane_tty -> last seen mtime (ms)
+  const TICK_MS = 1500;
+  const CPU_ACTIVE_THRESHOLD = 60;   // ~600ms CPU/1.5s — heavy tool
+                                     // execution only. Tuned higher
+                                     // than 12 (previous value) because
+                                     // codex/omx daemons emit periodic
+                                     // CPU bursts of 15-25 ticks every
+                                     // ~50s for token-counter / mcp-
+                                     // heartbeat work; the old threshold
+                                     // mis-classified those heartbeats
+                                     // as "running", causing minute-
+                                     // scale flip-flop. Real agent work
+                                     // spikes well above 60 ticks. PTY
+                                     // mtime carries the lighter signal
+                                     // (streamed tokens / quick output)
+                                     // since heartbeats never write to
+                                     // the visible buffer.
+  const QUIET_TICKS_TO_DONE = 8;     // running→done after 8 idle ticks
+                                     // (~12 s). Long enough that an LLM
+                                     // briefly thinking between bursts
+                                     // doesn't flicker the indicator,
+                                     // short enough that the user sees
+                                     // ✓ within a few seconds of real
+                                     // completion.
+  const CLICK_GRACE_MS = 3000;       // window the user just clicked is
+                                     // exempt from watcher decisions
+                                     // for this many ms. Absorbs the
+                                     // PTY redraw burst from select-
+                                     // window / select-pane so the row
+                                     // doesn't flip to "running" the
+                                     // instant the user clicks it.
+  //
+  // Activity = (a) CPU delta on any agent pid ≥ CPU_ACTIVE_THRESHOLD,
+  // OR (b) the pane's PTY mtime advanced this tick. Both signals are
+  // gated by the click-grace check so user input (which also bumps
+  // PTY) doesn't fake an agent running.
+  const WATCHER_LOG = path.join(CONFIG_DIR, 'watcher.log');
+  const WATCHER_LOG_MAX = 256 * 1024;
+  function wlog(msg) {
+    try {
+      try {
+        const st = fs.statSync(WATCHER_LOG);
+        if (st.size > WATCHER_LOG_MAX) {
+          const tail = fs.readFileSync(WATCHER_LOG).slice(-WATCHER_LOG_MAX / 2);
+          fs.writeFileSync(WATCHER_LOG, tail);
+        }
+      } catch {}
+      fs.appendFileSync(WATCHER_LOG, `${new Date().toISOString()} ${msg}\n`);
+    } catch {}
+  }
+
+  function tick() {
+    if (!sessionExists(SESSION)) return;
+    let out;
+    try {
+      out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
+        '#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_tty}\t#{pane_title}'],
+        { allowFail: true });
+    } catch { return; }
+    const proc = readProcIndex();
+    const byWin = new Map();
+    for (const line of out.split('\n')) {
+      if (!line) continue;
+      const [wid, widx, ppid, ptty, title] = line.split('\t');
+      if (title === 'nmux-linux-sidebar') continue;
+      if (!byWin.has(wid)) byWin.set(wid, { idx: widx, ppids: [], ptys: [] });
+      byWin.get(wid).ppids.push(ppid);
+      byWin.get(wid).ptys.push(ptty);
+    }
+    // Forget windows that no longer exist.
+    for (const wid of Array.from(prevQuietTicks.keys())) {
+      if (!byWin.has(wid)) prevQuietTicks.delete(wid);
+    }
+    // Forget PTY mtime baselines for vanished panes so stale entries
+    // don't pile up across long-running sessions.
+    const liveTtys = new Set();
+    for (const info of byWin.values()) for (const t of info.ptys) liveTtys.add(t);
+    for (const t of Array.from(prevPtyMtime.keys())) {
+      if (!liveTtys.has(t)) prevPtyMtime.delete(t);
+    }
+    // Garbage-collect prevCpu entries for pids that vanished.
+    const livePids = new Set();
+    for (const [, info] of byWin) {
+      for (const ppid of info.ppids) {
+        for (const apid of findAgentPidsInPane(ppid, proc)) livePids.add(apid);
+      }
+    }
+    for (const pid of Array.from(prevCpu.keys())) {
+      if (!livePids.has(pid)) prevCpu.delete(pid);
+    }
+    const now = Date.now();
+    for (const [wid, info] of byWin) {
+      const target = `${SESSION}:${info.idx}`;
+      // Click grace: if the user clicked this window within the last
+      // CLICK_GRACE_MS, skip the watcher entirely for this tick. This
+      // also rebases the PTY mtime so the redraw burst from the click
+      // doesn't register as activity on the next tick either.
+      const clickedAtStr = tmux(['show-window-options', '-t', target, '-v',
+        '@nmuxlinux_clicked_at'], { allowFail: true }).trim();
+      const clickedAt = parseInt(clickedAtStr, 10);
+      if (Number.isFinite(clickedAt) && now - clickedAt < CLICK_GRACE_MS) {
+        for (const ptty of info.ptys) {
+          if (!ptty || ptty === '-') continue;
+          try { prevPtyMtime.set(ptty, fs.statSync(ptty).mtimeMs); } catch {}
+        }
+        // Sample CPU baselines so we have fresh prev values once grace ends.
+        for (const apid of info.ppids.flatMap(pid => findAgentPidsInPane(pid, proc))) {
+          prevCpu.set(apid, readCpuTicks(apid));
+        }
+        continue;
+      }
+      const agents = info.ppids.flatMap(pid => findAgentPidsInPane(pid, proc));
+      let active = false;
+      const trigger = [];
+      // (a) CPU delta on any agent process
+      for (const apid of agents) {
+        const cur = readCpuTicks(apid);
+        const prev = prevCpu.get(apid);
+        prevCpu.set(apid, cur);
+        if (prev != null) {
+          const delta = cur - prev;
+          if (delta >= CPU_ACTIVE_THRESHOLD) {
+            active = true;
+            trigger.push(`cpu ${apid}:${delta}`);
+          }
+        }
+      }
+      // (b) PTY mtime advanced this tick — agent producing output.
+      // Single-tick bump now counts (we removed the two-in-a-row rule
+      // because LLM streams often have 1-tick stream / 1-tick pause /
+      // 1-tick stream patterns that the old rule misread as idle).
+      // The click-grace branch above absorbs the one-off PTY burst
+      // caused by tmux redrawing a freshly-selected pane, so a bare
+      // user click no longer false-triggers here.
+      if (agents.length) {
+        const PTY_MAX_GAP_MS = 30000;
+        for (const ptty of info.ptys) {
+          if (!ptty || ptty === '-') continue;
+          let mt = 0;
+          try { mt = fs.statSync(ptty).mtimeMs; } catch { continue; }
+          const prev = prevPtyMtime.get(ptty);
+          prevPtyMtime.set(ptty, mt);
+          if (prev != null && mt > prev) {
+            const gap = mt - prev;
+            // Real LLM streams / live tool output bump PTY mtime every
+            // tick or two (sub-second cadence). Gaps over PTY_MAX_GAP_MS
+            // (30s) almost always come from one-off background
+            // chatter — token-usage poll, mcp heartbeat, status-bar
+            // refresh — not user-visible agent work. Treat them as
+            // idle so the sidebar doesn't flip-flop every few minutes.
+            if (gap < PTY_MAX_GAP_MS) {
+              active = true;
+              trigger.push(`pty ${ptty}:+${Math.round(gap)}ms`);
+            }
+          }
+        }
+      }
+      const curStatus = tmux(['show-window-options', '-t', target, '-v', '@nmuxlinux_status'],
+        { allowFail: true }).trim();
+      const prevQuiet = prevQuietTicks.get(wid) ?? 0;
+      if (active) {
+        prevQuietTicks.set(wid, 0);
+        if (curStatus === 'idle' || curStatus === 'done' || curStatus === '') {
+          tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'running'],
+            { allowFail: true });
+          wlog(`w=${info.idx} idle→running agents=${agents.length} trigger=${trigger.join('|')}`);
+        }
+      } else {
+        const nq = prevQuiet + 1;
+        prevQuietTicks.set(wid, nq);
+        // Only drop running→done after N consecutive idle ticks. This
+        // is hysteresis: a single quiet tick between LLM token bursts
+        // no longer flickers the indicator. Other states (need-input,
+        // failed) are never overwritten by the watcher.
+        if (curStatus === 'running' && nq >= QUIET_TICKS_TO_DONE) {
+          tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'done'],
+            { allowFail: true });
+          wlog(`w=${info.idx} running→done (quiet ${nq} ticks)`);
+        }
+      }
+    }
+  }
+
+  // First tick can't decide activity (no previous CPU sample), so just
+  // populate baseline. Second tick onwards has meaningful deltas.
+  tick();
+  setInterval(tick, TICK_MS);
+}
+
+// After window-switch, focus the project's main shell pane so the user
+// lands in code rather than on the sidebar/right column.
+// Pane titling: every non-sidebar pane in a project window is named
+// `<project>-<role>` so the user can tell at a glance which slot
+// belongs to which project. Role suffixes are stable so JS lookups
+// can identify a pane by its purpose even when the project name
+// contains hyphens. Legacy hardcoded titles ('right-top', etc.) are
+// still recognized for windows built before this change.
+const PANE_ROLE_SUFFIX = {
+  main: '-main', sub: '-sub', status: '-status', bash: '-bash', webview: '-webview',
+};
+function paneTitleFor(project, role) {
+  if (!project || !PANE_ROLE_SUFFIX[role]) return '';
+  return project + PANE_ROLE_SUFFIX[role];
+}
+function paneRoleOf(title) {
+  if (!title) return null;
+  if (title === 'nmux-linux-sidebar') return 'sidebar';
+  // Legacy hardcoded titles — still seen on windows that were built
+  // before the project-prefixed naming convention. Keep matching
+  // them so refreshOverlays / resize-cols / click routing all still
+  // work on old layouts.
+  if (title === 'right-top') return 'status';
+  if (title === 'right-bot') return 'bash';
+  if (title === 'code-mid') return 'sub';
+  if (title === 'webview') return 'webview';
+  for (const [role, sfx] of Object.entries(PANE_ROLE_SUFFIX)) {
+    if (title.endsWith(sfx)) return role;
+  }
+  return null; // unknown — caller decides (usually means "treat as main")
+}
+function isReservedPaneTitle(title) {
+  const r = paneRoleOf(title);
+  return r !== null && r !== 'main';
+}
+// Legacy back-compat alias — keep code that imports the set working.
+const RESERVED_PANE_TITLES = {
+  has: t => isReservedPaneTitle(t),
+};
+function focusMainPane(target) {
+  const out = tmux(['list-panes', '-t', target, '-F', '#{pane_id}\t#{pane_title}\t#{pane_pid}'],
+    { allowFail: true });
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [pid, title, ppid] = line.split('\t');
+    if (RESERVED_PANE_TITLES.has(title)) continue;
+    if (isSidebarPid(ppid)) continue;
+    tmux(['select-pane', '-t', pid], { allowFail: true });
+    return;
   }
 }
 
@@ -859,13 +2584,18 @@ function findWindowForProject(session, project) {
 function notify({ project, status, message = '', session = SESSION }) {
   if (!project) throw new Error('--project required');
   status = String(status || 'done');
+  let target = null;
   if (sessionExists(session)) {
-    const target = findWindowForProject(session, project);
+    target = findWindowForProject(session, project);
     if (target) {
       tmux(['set-window-option', '-t', target, '@nmuxlinux_status', status]);
       tmux(['set-window-option', '-t', target, '@nmuxlinux_message', String(message).slice(0, 120)]);
     }
   }
+  // Log every notify so wrong-routing (e.g. PreToolUse from one Claude
+  // instance landing on the wrong project window) is debuggable after
+  // the fact. Uses the same rotating log writer as click events.
+  logClick(`notify project=${project} status=${status} target=${target || 'NO-MATCH'} caller_pane=${process.env.TMUX_PANE || '-'} caller_cwd=${process.env.PWD || '-'} msg=${(message || '').slice(0, 60)}`);
   fireDesktop(project, status, message);
   return { project, status, message, session };
 }
@@ -899,20 +2629,145 @@ function clearStatus(project) {
   if (!sessionExists(SESSION)) return;
   const target = findWindowForProject(SESSION, project);
   if (!target) return;
+  // Preserve "running" across a window-visit. The after-select-window
+  // hook fires clear-status on every visit, which is right for the
+  // "I saw the ✓ / ✕ / ?" terminal states — the user has acknowledged
+  // them, drop the indicator. But for "running" the spinner is the
+  // user's live signal that work is still in flight; dismissing it on
+  // visit would lie about the agent being idle.
+  const cur = tmux(['show-window-options', '-t', target, '-v', '@nmuxlinux_status'],
+    { allowFail: true }).trim();
+  if (cur === 'running') return;
   tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'idle'], { allowFail: true });
   tmux(['set-window-option', '-t', target, '@nmuxlinux_message', ''], { allowFail: true });
 }
 
+function currentNmuxWindowTarget() {
+  if (process.env.TMUX) {
+    const info = tmux(['display-message', '-p', '#{session_name}\t#{window_index}'], { allowFail: true });
+    const [s, idx] = info.split('\t');
+    if (s === SESSION && idx) return `${SESSION}:${idx}`;
+  }
+  const active = tmux(['list-windows', '-t', SESSION, '-F', '#{?window_active,#{window_index},}'], { allowFail: true })
+    .split('\n').find(Boolean);
+  const idx = active || (tmux(['list-windows', '-t', SESSION, '-F', '#{window_index}'], { allowFail: true }).split('\n')[0] || '').trim();
+  return idx ? `${SESSION}:${idx}` : null;
+}
+
+function listPaneInfo(target) {
+  const out = tmux(['list-panes', '-t', target, '-F',
+    '#{pane_id}\t#{pane_title}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_pid}'],
+    { allowFail: true });
+  return out.split('\n').filter(Boolean).map(line => {
+    const [pid, title, cwd, cmd, rootPid] = line.split('\t');
+    return { pid, title, cwd, cmd, rootPid };
+  });
+}
+
+function findMainPane(panes, projectName = '') {
+  return panes.find(p => p.title === paneTitleFor(projectName, 'main'))
+    || panes.find(p => p.title === projectName) // legacy plain-name
+    || panes.find(p => paneRoleOf(p.title) === null || paneRoleOf(p.title) === 'main')
+    || panes[0];
+}
+
+function isLikelyUrl(s) {
+  return /^(https?:\/\/|file:\/\/|localhost[:/]|127\.0\.0\.1[:/])/.test(String(s || ''));
+}
+
+function previewHelp() {
+  return 'usage: nmux-linux preview [--external|--cmd] [--focus] <url|command>';
+}
+
+function previewCommand(args) {
+  if (!sessionExists(SESSION)) throw new Error('nmux-linux session is not running');
+  const flagValue = typeof args.cmd === 'string' ? args.cmd
+    : typeof args.external === 'string' ? args.external
+      : typeof args.focus === 'string' ? args.focus
+      : '';
+  const input = (flagValue || args._.slice(1).join(' ')).trim();
+  if (!input) throw new Error(previewHelp());
+  const target = currentNmuxWindowTarget();
+  if (!target) throw new Error('no nmux-linux window found');
+
+  const panes = listPaneInfo(target);
+  const rightTop = panes.find(p => paneRoleOf(p.title) === 'status' || paneRoleOf(p.title) === 'webview');
+  if (!rightTop) throw new Error('status pane not found; run `nmux-linux relayout` first');
+  const info = tmux(['display-message', '-p', '-t', target, '#{@nmuxlinux_project}\t#{pane_current_path}'], { allowFail: true });
+  const [projectName] = info.split('\t');
+  const main = findMainPane(panes, projectName);
+
+  if (args.external) {
+    const opener = which('xdg-open');
+    if (!opener) throw new Error('xdg-open not found; install xdg-utils or run `nmux-linux preview --cmd <command>`');
+    spawnSync(opener, [input], { detached: true, stdio: 'ignore' });
+    userMsg(`nmux-linux: opened externally ${input}`, 2500);
+    if (!args.focus && main) tmux(['select-pane', '-t', main.pid], { allowFail: true });
+    return;
+  }
+
+  let cmd;
+  if (args.cmd || !isLikelyUrl(input)) {
+    cmd = input;
+  } else {
+    const browser = ['w3m', 'lynx', 'elinks', 'links'].map(which).find(Boolean);
+    if (!browser) {
+      throw new Error('no terminal browser found (w3m, lynx, elinks, links). Install one, use `--external`, or use `--cmd <command>`.');
+    }
+    cmd = `${shQuote(browser)} ${shQuote(input)}`;
+  }
+
+  const cwd = rightTop.cwd || (main && main.cwd) || HOME;
+  const shell = process.env.SHELL || '/bin/bash';
+  tmux(['respawn-pane', '-k', '-t', rightTop.pid, '-c', cwd,
+    `bash -lc ${shEsc(`printf '\\033]2;webview\\033\\\\'; exec ${shell} -lc ${shQuote(cmd)}`)}`],
+    { allowFail: false });
+  tmux(['select-pane', '-t', rightTop.pid, '-T', paneTitleFor(projectName, 'webview')], { allowFail: true });
+  if (args.focus) tmux(['select-pane', '-t', rightTop.pid], { allowFail: true });
+  else if (main) tmux(['select-pane', '-t', main.pid], { allowFail: true });
+  userMsg(`nmux-linux: preview in right-top`, 2500);
+}
+
 function notifyCurrent(opts) {
-  let project = opts.project, session = opts.session || SESSION;
+  let project = opts.project;
+  // Always notify into the nmux-linux session — that's where the sidebar
+  // lives. The caller (Claude / omx hook) may be running in any tmux
+  // session (or none); we resolve which nmux project this should hit by
+  // looking at the caller's pane_current_path and matching it against
+  // the registered project list. Without this, a Claude instance running
+  // in `_bootstrap` would set status on its own (sidebar-less) session
+  // and silently never reach the user's sidebar.
+  const session = opts.session || SESSION;
   if (!project && process.env.TMUX) {
     try {
-      const info = tmux(['display-message', '-p', '#{session_name}\t#{@nmuxlinux_project}\t#{window_name}']);
-      const [s, proj, win] = info.split('\t');
-      session = s || session;
-      project = proj || (win || '').replace(/^[✓✕?…! ]+\s*/, '');
+      const info = tmux(['display-message', '-p',
+        '#{@nmuxlinux_project}\t#{window_name}\t#{pane_current_path}']);
+      const [proj, win, cwd] = info.split('\t');
+      // 1) Direct: caller pane is inside an nmux-linux window
+      project = (proj || '').trim();
+      // 2) Indirect: caller pane is anywhere on disk, but its cwd
+      //    matches (or is inside) a registered project directory
+      if (!project && cwd) {
+        try {
+          const cfg = loadConfig();
+          const projects = (cfg && cfg.projects) || [];
+          const match = projects
+            .filter(p => p.cwd && (cwd === p.cwd || cwd.startsWith(p.cwd + '/')))
+            // Prefer the deepest match so a nested project beats its parent
+            .sort((a, b) => b.cwd.length - a.cwd.length)[0];
+          if (match) project = match.name;
+        } catch {}
+      }
+      // 3) Last resort: cleaned window name
+      if (!project) project = (win || '').replace(/^[✓✕?…! ]+\s*/, '').trim();
     } catch {}
   }
+  // No active-window fallback: that would route external Claude/omx
+  // hooks (TMUX env absent, cwd matches nothing) onto whatever window
+  // the user happens to be looking at — flagging unrelated projects
+  // as "running". The agent watcher daemon (`watch-agents`) handles
+  // detection from process trees instead; this resolver only fires
+  // status when we can attribute it to a real project.
   if (!project) project = 'unknown';
   return notify({ ...opts, project, session });
 }
@@ -922,11 +2777,21 @@ function status() {
   if (!sessionExists(SESSION)) { console.log('nmux-linux session: (not running)'); return; }
   const out = tmux(['list-windows', '-t', SESSION, '-F',
     '#{window_index}\t#{window_name}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}']);
+  const proc = readProcIndex();
   console.log(`nmux-linux session: ${SESSION}`);
   for (const line of out.split('\n')) {
     if (!line) continue;
     const [idx, name, st, proj, msg] = line.split('\t');
     console.log(`  ${idx}. [${st || 'idle'}] ${proj || name}${msg ? ' — ' + msg : ''}`);
+    const panes = tmux(['list-panes', '-t', `${SESSION}:${idx}`, '-F',
+      '#{pane_id}\t#{pane_title}\t#{pane_current_command}\t#{pane_pid}'],
+      { allowFail: true });
+    for (const pLine of panes.split('\n')) {
+      if (!pLine) continue;
+      const [paneId, title, cmd, rootPid] = pLine.split('\t');
+      const hud = paneIsOmxHud(rootPid, proc, cmd) ? ' [OMX-HUD]' : '';
+      console.log(`      ${paneId} ${title || '(untitled)'} (${cmd || '?'})${hud}`);
+    }
   }
   const state = loadState();
   console.log(`open-set persisted: ${(state.open || []).join(', ') || '(none)'}`);
@@ -980,20 +2845,112 @@ function main() {
   const cmd = args._[0] || 'launch';
   if (cmd === 'help' || args.help) { console.log(HELP); return; }
   if (cmd === 'init')      { const cfg = initConfig({ force: args.force }); console.log(`config: ${CONFIG_PATH} (${cfg.projects.length} projects)`); return; }
-  if (cmd === 'apply')     { applySession({ replace: Boolean(args.replace) }); console.log(`session ${SESSION} ready`); return; }
-  if (cmd === 'launch')    { if (!fs.existsSync(CONFIG_PATH)) initConfig(); applySession({ replace: false }); attach(SESSION); return; }
-  if (cmd === 'refresh')   { if (sessionExists(SESSION)) installBindings(SESSION); console.log('bindings reapplied'); return; }
+  if (cmd === 'apply')     { applySession({ replace: Boolean(args.replace) }); startWatcherDaemonIfNeeded(); console.log(`session ${SESSION} ready`); return; }
+  if (cmd === 'launch')    { if (!fs.existsSync(CONFIG_PATH)) initConfig(); applySession({ replace: false }); startWatcherDaemonIfNeeded(); attach(SESSION); return; }
+  if (cmd === 'refresh')   { if (sessionExists(SESSION)) installBindings(SESSION); startWatcherDaemonIfNeeded(); console.log('bindings reapplied'); return; }
   if (cmd === 'refresh-sidebars') { refreshSidebars(); return; }
   if (cmd === 'status')    { status(); return; }
   if (cmd === 'kill')      { killSession(); console.log('killed'); return; }
   if (cmd === 'confirm-kill') { confirmKill(); return; }
   if (cmd === 'click')     { clickHandler(args._[1], args._[2], args._[3]); return; }
+  if (cmd === 'click-url') { clickUrlAtPane(args._[1], args._[2]); return; }
+  if (cmd === 'task-overlay') { taskOverlayDaemon(args.cwd); return; }
+  if (cmd === 'task-scroll') {
+    // Args: <up|down|top> <pane_id>
+    const dir = (args._[1] || '').toLowerCase();
+    const pid = args._[2];
+    if (pid && (dir === 'up' || dir === 'down' || dir === 'top')) {
+      appendTaskEvent(pid, `SCROLL ${dir.toUpperCase()}`);
+    }
+    return;
+  }
+  if (cmd === 'task-click') {
+    // Args: <mouse_y> <pane_id>
+    const y = parseInt(args._[1], 10);
+    const pid = args._[2];
+    if (Number.isFinite(y) && pid) appendTaskEvent(pid, `CLICK ${y}`);
+    return;
+  }
+  if (cmd === 'mouseup') {
+    // Args: <pane_id> <session> <pane_title> <mouse_y> <mouse_x>
+    // Dispatches the click:
+    //   sidebar  → project click
+    //   status   → task-overlay row click → jump main pane
+    //   else      → just select the pane
+    const pid = args._[1];
+    const sess = args._[2];
+    const title = args._[3];
+    const y = parseInt(args._[4], 10);
+    const x = parseInt(args._[5], 10);
+    if (!pid) return;
+    if (sess === SESSION) {
+      const role = paneRoleOf(title);
+      if (role === 'sidebar') {
+        clickHandler(String(y), String(x), pid);
+        return;
+      }
+      if (role === 'status') {
+        if (Number.isFinite(y)) appendTaskEvent(pid, `CLICK ${y}`);
+        return;
+      }
+    }
+    // Default: just select the clicked pane.
+    spawnSync('tmux', ['select-pane', '-t', pid], { stdio: 'ignore' });
+    return;
+  }
+  if (cmd === 'wheel') {
+    // Args: <up|down> <pane_id> <session> <pane_title> <pane_in_mode> <mouse_any_flag>
+    // Dispatches the wheel event:
+    //   sidebar  → swallow
+    //   right-top → forward to task-overlay event queue
+    //   else      → re-issue tmux's stock wheel behaviour
+    const dir = (args._[1] || '').toLowerCase();
+    const pid = args._[2];
+    const sess = args._[3];
+    const title = args._[4];
+    const inMode = args._[5] === '1';
+    const mouseAny = args._[6] === '1';
+    if (!pid) return;
+    if (sess === SESSION) {
+      const role = paneRoleOf(title);
+      if (role === 'sidebar') return; // swallow
+      if (role === 'status') {
+        appendTaskEvent(pid, `SCROLL ${dir.toUpperCase()}`);
+        return;
+      }
+    }
+    // Stock behaviour: if pane is in copy-mode or has mouse passthrough,
+    // forward the raw mouse event; otherwise wheel-up enters copy-mode
+    // (so the user sees scrollback) and wheel-down forwards to the app.
+    if (inMode || mouseAny) {
+      spawnSync('tmux', ['send-keys', '-t', pid, '-M'], { stdio: 'ignore' });
+    } else if (dir === 'up') {
+      spawnSync('tmux', ['copy-mode', '-e', '-t', pid], { stdio: 'ignore' });
+    } else {
+      spawnSync('tmux', ['send-keys', '-t', pid, '-M'], { stdio: 'ignore' });
+    }
+    return;
+  }
+  if (cmd === 'git-overlay') { gitOverlayDaemon(args.cwd); return; }
+  if (cmd === 'refresh-overlays') { refreshOverlays(); return; }
+  if (cmd === 'relayout-3col') { relayout3col(); return; }
+  if (cmd === 'resize-cols') { resizeCols(); return; }
+  if (cmd === 'watch-agents') { watchAgentsDaemon(); return; }
+  if (cmd === 'kill-watcher') {
+    try {
+      const pid = parseInt(fs.readFileSync(WATCHER_PID_FILE, 'utf8'), 10);
+      if (Number.isFinite(pid)) process.kill(pid, 'SIGTERM');
+    } catch {}
+    return;
+  }
   if (cmd === 'prompt')    { promptCommand(); return; }
   if (cmd === 'open')      { openProject(args._[1]); return; }
   if (cmd === 'close-window') { closeWindow(args._[1]); return; }
   if (cmd === 'close-current') { closeCurrent(); return; }
   if (cmd === 'relayout-current' || cmd === 'relayout') { relayoutCurrent(); return; }
   if (cmd === 'fix-layout') { fixLayout(); return; }
+  if (cmd === 'clean-omx-hud') { console.log(`killed ${killOmxHudPanes()} omx HUD pane(s)`); return; }
+  if (cmd === 'preview' || cmd === 'webview') { previewCommand(args); return; }
   if (cmd === 'disable-omx-hud') { disableOmxHud(); return; }
   if (cmd === 'enable-omx-hud') { enableOmxHud(); return; }
   if (cmd === 'save-state'){ captureAndSaveOpen(SESSION); console.log('state saved'); return; }

@@ -1,0 +1,10 @@
+.git/
+.omx/
+.omc/
+**/.omx/
+**/.omc/
+node_modules/
+test/.docker-build-cache/
+*.log
+*.tgz
+.DS_Store

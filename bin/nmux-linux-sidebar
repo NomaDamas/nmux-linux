@@ -42,23 +42,27 @@ function t(args) {
 const SPINNER = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
 let __frame = 0;
 
-function icon(s) {
-  if (s === 'done') return '✓';
-  if (s === 'failed') return '✕';
-  if (s === 'need-input') return '?';
-  if (s === 'running') return SPINNER[__frame % SPINNER.length];
+// Single-glyph status badge, always 1 cell, sits left of the project
+// name. Mapping the user signed off on:
+//   running → animated spinner (alive)
+//   done    → ✓ (just finished, awaiting acknowledgement)
+//   idle    → blank (acknowledged / nothing happening)
+//   failed  → ✕   (kept so failures don't silently look like done)
+//   need-input → ? (kept so blocking prompts are visible)
+function icon(s, frame = __frame) {
+  if (s === 'done')        return '\x1b[1;32m✓\x1b[0m';
+  if (s === 'failed')      return '\x1b[1;31m✕\x1b[0m';
+  if (s === 'need-input')  return '\x1b[1;33m?\x1b[0m';
+  if (s === 'running')     return '\x1b[1;36m' + SPINNER[frame % SPINNER.length] + '\x1b[0m';
   return ' ';
 }
 
-// Returns ANSI prefix that paints the *entire row* (background block) for
-// "loud" done/failed/need-input states so the user sees them at a glance,
-// and a quieter foreground-only style for running/active/idle.
+// Row chrome stays minimal: just a reverse highlight on the active
+// window so the user can locate where they are. Status differentiation
+// lives entirely in icon() above — no whole-row color blocks (those
+// were "eye-strain loud" and shoved layout when status changed).
 function rowStyle(s, active) {
-  if (s === 'done')        return { open: '\x1b[1;30;42m', close: '\x1b[0m', loud: true };  // black on green
-  if (s === 'failed')      return { open: '\x1b[1;97;41m', close: '\x1b[0m', loud: true };  // white on red
-  if (s === 'need-input')  return { open: '\x1b[1;30;43m', close: '\x1b[0m', loud: true };  // black on yellow
-  if (s === 'running')     return { open: '\x1b[1;36m',    close: '\x1b[0m', loud: false }; // bold cyan fg
-  if (active)              return { open: '\x1b[7m',       close: '\x1b[0m', loud: false }; // reverse
+  if (active) return { open: '\x1b[7m', close: '\x1b[0m', loud: false };
   return { open: '', close: '', loud: false };
 }
 function termWidth() { return process.stdout.columns || 26; }
@@ -117,27 +121,27 @@ function persistOpen(rows) {
   } catch {}
 }
 
-function render() {
-  const w = termWidth();
-  const fmt = '#{window_index}\t#{window_name}\t#{window_active}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}';
-  const out = t(['list-windows', '-t', SESSION, '-F', fmt]);
-  const rows = out
-    ? out.split('\n').map(l => {
-        const [i, n, a, s, p, m] = l.split('\t');
-        return { i, n, a: a === '1', s, p: p || n, m };
-      })
+function parseRows(out) {
+  return out
+    ? out.split('\n').filter(Boolean).map(l => {
+      const [i, n, a, s, p, m] = l.split('\t');
+      return { i, n, a: a === '1', s, p: p || n, m };
+    })
     : [];
-  const registry = loadRegistry();
+}
+
+function buildSidebarFrame({ rows, registry, discover, width, frame = __frame }) {
+  const w = width || 26;
   const openNames = new Set(rows.map(r => (r.p || r.n).replace(/^[✓✕?…! ]+\s*/, '')));
   const closed = registry.filter(p => !openNames.has(p.name));
   const registryNames = new Set(registry.map(p => p.name));
-  const discover = scanSubfolders()
+  const visibleDiscover = discover
     .filter(p => !openNames.has(p.name) && !registryNames.has(p.name))
     .slice(0, DISCOVER_LIMIT);
 
-  let buf = '\x1b[2J\x1b[H';
-  buf += '\x1b[1;38;5;46m nmux-linux\x1b[0m \x1b[2m· projects\x1b[0m\n';
-  buf += '\x1b[2m' + '─'.repeat(Math.min(w - 1, 30)) + '\x1b[0m\n';
+  const lines = [];
+  lines.push('\x1b[1;38;5;46m nmux-linux\x1b[0m \x1b[2m· projects\x1b[0m');
+  lines.push('\x1b[2m' + '─'.repeat(Math.min(w - 1, 30)) + '\x1b[0m');
 
   // Each entry: row<TAB>action<TAB>arg<TAB>colMin
   const map = [];
@@ -150,7 +154,7 @@ function render() {
     const style = rowStyle(r.s, r.a);
     const arrow = r.a ? '▸' : ' ';
     const idxs = String(r.i).padStart(2);
-    const ic = icon(r.s);
+    const ic = icon(r.s, frame);
     if (style.loud) {
       // Whole-row colored block — name + status + close button all on the
       // background color. Stays loud until the user visits the window
@@ -159,80 +163,253 @@ function render() {
       const padded = pad(inner, w - 3);
       // Render close × in the same row block but with explicit fg/bg
       // so it stays readable on the colored background.
-      buf += style.open + padded + ' ×' + style.close + '\n';
+      lines.push(style.open + padded + ' ×' + style.close);
     } else {
       const left = `${style.open}${arrow}${idxs} ${ic} ${name}${style.close}`;
       const padded = pad(left, w - 3);
       const closeMark = r.a ? ' \x1b[1;31m×\x1b[0m' : ' \x1b[2;31m×\x1b[0m';
-      buf += padded + closeMark + '\n';
+      lines.push(padded + closeMark);
     }
     map.push(`${row}\tswitch\t${r.i}\t0`);
     map.push(`${row}\tclose\t${r.i}\t${closeColMin}`);
     row++;
-    if (r.m) {
-      const msgLine = ` \x1b[2m${r.m.slice(0, w - 4)}\x1b[0m`;
-      buf += pad(msgLine, w - 1) + '\n';
-      map.push(`${row}\tswitch\t${r.i}\t0`);
-      row++;
-    }
+    // Intentionally no message line: per-row second line was the source
+    // of layout shifts whenever a notify message arrived (e.g. bell ->
+    // "bell" text pushing the rest of the sidebar down by 1). State
+    // lives in the icon now; the message is dropped from the visual.
   }
 
   // spacer
-  buf += '\n'; row++;
+  lines.push(''); row++;
 
   // -------- closed registered projects (reopen) --------
   if (closed.length) {
-    buf += pad('\x1b[2m closed (click to reopen)\x1b[0m', w - 1) + '\n';
+    lines.push(pad('\x1b[2m closed (click to reopen)\x1b[0m', w - 1));
     row++;
     // limit to first 12 to avoid overwhelming sidebar
     for (const p of closed.slice(0, 20)) {
-      buf += pad(`\x1b[37m   ${p.name}\x1b[0m`, w - 1) + '\n';
+      lines.push(pad(`\x1b[37m   ${p.name}\x1b[0m`, w - 1));
       map.push(`${row}\treopen\t${p.name}\t0`);
       row++;
     }
-    buf += '\n'; row++;
+    lines.push(''); row++;
   }
 
   // -------- discoverable subfolders (not yet a project) --------
-  if (discover.length) {
-    buf += pad('\x1b[2m new (click to start)\x1b[0m', w - 1) + '\n';
+  if (visibleDiscover.length) {
+    lines.push(pad('\x1b[2m new (click to start)\x1b[0m', w - 1));
     row++;
-    for (const p of discover) {
-      buf += pad(`\x1b[36m   ${p.name}\x1b[0m`, w - 1) + '\n';
+    for (const p of visibleDiscover) {
+      lines.push(pad(`\x1b[36m   ${p.name}\x1b[0m`, w - 1));
       map.push(`${row}\treopen\t${p.name}\t0`);
       row++;
     }
-    buf += '\n'; row++;
+    lines.push(''); row++;
   }
 
   // -------- + new project --------
-  buf += pad('\x1b[1;36m + new project\x1b[0m', w - 1) + '\n';
+  lines.push(pad('\x1b[1;36m + new project\x1b[0m', w - 1));
   map.push(`${row}\tadd\t-\t0`);
   row++;
 
   // -------- ⊗ kill nmux-linux --------
-  buf += pad('\x1b[1;31m ⊗ kill nmux-linux\x1b[0m', w - 1) + '\n';
+  lines.push(pad('\x1b[1;31m ⊗ kill nmux-linux\x1b[0m', w - 1));
   map.push(`${row}\tkill\t-\t0`);
   row++;
 
   // hints
-  buf += '\n\x1b[2m click row=switch\n × close window\n M-1..9 keys\n prefix C: new\n prefix X: close\x1b[0m\n';
+  lines.push('');
+  lines.push('\x1b[2m click row=switch');
+  lines.push(' × close window');
+  lines.push(' M-1..9 keys');
+  lines.push(' prefix C: new');
+  lines.push(' prefix X: close\x1b[0m');
 
-  process.stdout.write(buf);
-  try { writeAtomic(CLICKMAP_PATH, map.join('\n') + '\n'); } catch {}
-  persistOpen(rows);
+  return {
+    body: lines.map(line => line + '\x1b[K').join('\n') + '\n\x1b[J',
+    clickmap: map.join('\n') + '\n',
+  };
 }
 
-render();
-// Faster cadence so newly-added projects appear ~immediately and the
-// running spinner animates smoothly.
-const timer = setInterval(() => { __frame = (__frame + 1) % SPINNER.length; render(); }, 200);
-// Allow the nmux-linux command to nudge us for an instant repaint.
-process.on('SIGUSR1', () => render());
+const SCAN_INTERVAL_MS = 2000;
+const STATE_INTERVAL_MS = 1000;
+const RESIZE_CHECK_INTERVAL_MS = 1500;
+const RESIZE_QUIET_MS = 400;          // wait this long after last width change
+                                      // before issuing a self-correcting resize
+                                      // (debounce mid-drag flickers)
+const SYNC_BEGIN = '\x1b[?2026h';
+const SYNC_END = '\x1b[?2026l';
+// xterm alternate-screen sequences. Entering "1049" gives us a clean
+// per-pane buffer with no scrollback — every re-render only touches the
+// alt buffer, so user wheel-scroll / copy-mode shows the current sidebar
+// state and nothing else (no stale "closed" project list bleeding through
+// from earlier paints). Exiting on shutdown restores the main buffer.
+const ALT_SCREEN_ENTER = '\x1b[?1049h';
+const ALT_SCREEN_EXIT  = '\x1b[?1049l';
+let __registryCache = [];
+let __discoverCache = [];
+let __nextScanAt = 0;
+let __nextStateAt = 0;
+let __nextResizeCheckAt = 0;
+let __lastWidthSeen = 0;
+let __lastWidthChangeAt = 0;
+let __lastBody = null;
+let __lastClickmap = null;
+let __firstPaint = true;
+let __rendering = false;
+let __renderAgain = false;
 
-// Best-effort cleanup of the per-pane clickmap on exit so stale files
-// don't accumulate in CLICKMAP_DIR.
-function __exitCleanup() { try { fs.unlinkSync(CLICKMAP_PATH); } catch {} }
-process.on('SIGTERM', () => { clearInterval(timer); __exitCleanup(); process.exit(0); });
-process.on('SIGINT',  () => { clearInterval(timer); __exitCleanup(); process.exit(0); });
-process.on('exit',    __exitCleanup);
+function refreshCaches(now, force = false) {
+  if (!force && now < __nextScanAt) return;
+  __registryCache = loadRegistry();
+  __discoverCache = scanSubfolders();
+  __nextScanAt = now + SCAN_INTERVAL_MS;
+}
+
+// Configured sidebar width (cells). Falls back to 26 when projects.json
+// is unreadable. Cached for the lifetime of the sidebar process — width
+// changes require a refresh-sidebars anyway.
+let __expectedWidthCache = null;
+function expectedWidth() {
+  if (__expectedWidthCache != null) return __expectedWidthCache;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const w = Number(cfg.sidebarWidth);
+    __expectedWidthCache = Number.isFinite(w) && w > 0 ? w : 26;
+  } catch { __expectedWidthCache = 26; }
+  return __expectedWidthCache;
+}
+
+// Defense in depth: tmux hooks pin the sidebar width on common events,
+// but a manual border-drag with no subsequent event (or a race during
+// new-window setup) can leave the sidebar drifted. Once the visible
+// width has been stable for RESIZE_QUIET_MS and still differs from the
+// configured cell-width, request a one-shot resize-pane back.
+function selfCorrectWidth(now) {
+  if (now < __nextResizeCheckAt) return;
+  __nextResizeCheckAt = now + RESIZE_CHECK_INTERVAL_MS;
+  const cur = process.stdout.columns || 0;
+  if (!cur) return;
+  if (cur !== __lastWidthSeen) {
+    __lastWidthSeen = cur;
+    __lastWidthChangeAt = now;
+    return;
+  }
+  if (now - __lastWidthChangeAt < RESIZE_QUIET_MS) return;
+  const want = expectedWidth();
+  if (cur === want) return;
+  const pane = process.env.TMUX_PANE;
+  if (!pane) return;
+  spawnSync('tmux', ['resize-pane', '-t', pane, '-x', String(want)], { stdio: 'ignore' });
+}
+
+function terminalFrame(body) {
+  const clear = __firstPaint ? '\x1b[2J\x1b[H' : '\x1b[H';
+  return SYNC_BEGIN + clear + body + SYNC_END;
+}
+
+let __anyRunning = false;
+function render({ forceScan = false } = {}) {
+  if (__rendering) { __renderAgain = true; return; }
+  __rendering = true;
+  try {
+    const now = Date.now();
+    refreshCaches(now, forceScan);
+    selfCorrectWidth(now);
+    const w = termWidth();
+    const fmt = '#{window_index}\t#{window_name}\t#{window_active}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}';
+    const rows = parseRows(t(['list-windows', '-t', SESSION, '-F', fmt]));
+    __anyRunning = rows.some(r => r.s === 'running');
+    const { body, clickmap } = buildSidebarFrame({
+      rows,
+      registry: __registryCache,
+      discover: __discoverCache,
+      width: w,
+      frame: __frame,
+    });
+
+    if (body !== __lastBody) {
+      process.stdout.write(terminalFrame(body));
+      __firstPaint = false;
+      __lastBody = body;
+    }
+    if (clickmap !== __lastClickmap) {
+      try { writeAtomic(CLICKMAP_PATH, clickmap); } catch {}
+      __lastClickmap = clickmap;
+    }
+    if (forceScan || now >= __nextStateAt) {
+      persistOpen(rows);
+      __nextStateAt = now + STATE_INTERVAL_MS;
+    }
+  } finally {
+    __rendering = false;
+  }
+  if (__renderAgain) {
+    __renderAgain = false;
+    render({ forceScan });
+  }
+}
+
+const TICK_FAST_MS = 200;     // while a spinner needs to animate
+const TICK_SLOW_MS = 1000;    // idle — every sidebar polls list-windows
+                              // each tick, so N sidebars × fast = N×5 IPCs/sec.
+                              // Slowing the idle case cuts tmux-server load
+                              // ~5× without affecting interactive feel.
+function start() {
+  // Scrollback containment for the sidebar pane — but NOT via
+  // `set-option -p history-limit 0`. In some tmux versions that
+  // setting bleeds globally (server-wide default), and any pane
+  // created after the sidebar boots inherits limit=0, killing wheel-
+  // scroll on the user's main / right-top / right-bot panes. Instead
+  // we rely on:
+  //   • alt-screen mode (entered just below) so the live frame uses
+  //     the alt buffer
+  //   • clear-history on every render of this pane (cheap; called from
+  //     render()), keeping the alt buffer scrollback empty without
+  //     touching tmux's global history-limit
+  if (process.env.TMUX_PANE) {
+    spawnSync('tmux', ['clear-history', '-t', process.env.TMUX_PANE],
+              { stdio: 'ignore' });
+  }
+  // Switch the pane to its alternate screen buffer up-front so the
+  // initial bash prompt / any pre-sidebar output stays behind in the
+  // main buffer and never bleeds into our render. Every subsequent
+  // terminalFrame() targets the alt buffer; on exit we drop back so
+  // the pane closes cleanly.
+  process.stdout.write(ALT_SCREEN_ENTER);
+  render({ forceScan: true });
+  let __timer = null;
+  function schedule() {
+    const delay = __anyRunning ? TICK_FAST_MS : TICK_SLOW_MS;
+    __timer = setTimeout(() => {
+      __frame = (__frame + 1) % SPINNER.length;
+      render();
+      schedule();
+    }, delay);
+  }
+  schedule();
+
+  // Allow the nmux-linux command to nudge us for an instant repaint.
+  // Cancel the pending slow tick so the SIGUSR1 repaint isn't followed
+  // by a stale-content wait.
+  process.on('SIGUSR1', () => {
+    if (__timer) clearTimeout(__timer);
+    render({ forceScan: true });
+    schedule();
+  });
+
+  // Best-effort cleanup of the per-pane clickmap on exit so stale files
+  // don't accumulate in CLICKMAP_DIR. Also drop the alternate screen so
+  // the pane reverts to whatever was in the main buffer (typically
+  // empty if the pane is about to die anyway).
+  function __exitCleanup() {
+    try { process.stdout.write(ALT_SCREEN_EXIT); } catch {}
+    try { fs.unlinkSync(CLICKMAP_PATH); } catch {}
+  }
+  process.on('SIGTERM', () => { if (__timer) clearTimeout(__timer); __exitCleanup(); process.exit(0); });
+  process.on('SIGINT',  () => { if (__timer) clearTimeout(__timer); __exitCleanup(); process.exit(0); });
+  process.on('exit',    __exitCleanup);
+}
+
+if (require.main === module) start();
+else module.exports = { buildSidebarFrame, icon, pad, parseRows, SPINNER, terminalFrame };

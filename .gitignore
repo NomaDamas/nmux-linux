@@ -1,6 +1,9 @@
 node_modules/
 *.log
+*.tgz
 .DS_Store
 .omc/
 .omx/
+**/.omc/
+**/.omx/
 test/.docker-build-cache/

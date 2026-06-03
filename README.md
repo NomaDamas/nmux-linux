@@ -1,8 +1,16 @@
 # nmux-linux
 
-Linux-only tmux addon that turns one tmux session into a per-project
-workspace with a clickable sidebar and high-visibility status indicators
-for AI coding agents (Claude Code, Codex, etc.).
+**Nomadamas Open Source · a Linux-native tmux front-end for multi-project agent workspaces.**
+
+cmux-style workflows are compelling, but Linux users should not have to
+wait for a dedicated desktop front-end to get a fast, keyboard-native
+multi-session cockpit. `nmux-linux` turns plain tmux into a project-aware
+workspace: a live clickable sidebar, a main coding pane, and managed
+right-side panes for agent status, shell work, and previews.
+
+It is intentionally small: no daemon, no cloud service, no GUI runtime.
+Just tmux, Node.js, and a layout that makes multiple coding-agent
+sessions feel like one coherent Linux workbench.
 
 ```
 ┌────────────┬──────────────────────────┬─────────────┐
@@ -34,7 +42,8 @@ for AI coding agents (Claude Code, Codex, etc.).
   tears the whole session down.
 - **3-column default layout per window** — sidebar (fixed 24-cell
   width, pinned via tmux hooks even after attach/resize) | main shell
-  (covers sidebar→middle) | right column split top/bottom.
+  (covers sidebar→middle) | right column split into managed top/bottom panes. The
+  top-right/status pane can be reused as a managed preview/webview slot.
 - **Open-set persistence** — the sidebar writes the list of currently
   open windows to `~/.config/nmux-linux/state.json` every 0.5s. Next
   `nmux-linux launch` re-creates exactly that set.
@@ -53,8 +62,12 @@ for AI coding agents (Claude Code, Codex, etc.).
   Claude is actually doing.
 - **omx (oh-my-codex) HUD opt-out (optional)** — patches `reconcile.js`
   and `hud/tmux.js` to honor a marker file at
-  `~/.config/nmux-linux/disable-hud-omx`, so omx stops auto-spawning a
-  HUD pane below your main pane.
+  `~/.config/nmux-linux/disable-hud-omx`, and `fix-layout`/
+  `clean-omx-hud` remove definite stale `omx hud --watch` panes so omx
+  stops leaving a HUD pane below your main pane.
+- **Right-pane preview MVP** — `nmux-linux preview` / `webview` reuses
+  the managed top-right pane for a terminal browser, a user-supplied command, or
+  `xdg-open` external handoff without creating extra panes.
 
 No daemon, no external services. Two Node.js scripts plus a couple of
 shell shims.
@@ -72,7 +85,7 @@ sound are disabled but everything else works.
 ## Install
 
 ```bash
-git clone https://github.com/Cheol-H-Jeong/nmux-linux.git
+git clone https://github.com/<your-org-or-user>/nmux-linux.git
 cd nmux-linux
 ./install.sh
 ```
@@ -118,7 +131,7 @@ Useful flags:
 ```
 nmux-linux                 launch + attach (default)
 nmux-linux launch          idem
-nmux-linux init [--force]  rescan ~/projects (and ~/projects/private) for git repos
+nmux-linux init [--force]  rescan configured project roots for git repos
 nmux-linux apply [--replace]  rebuild session from the persisted open-set
 nmux-linux refresh         reapply tmux options/bindings to a running session
 nmux-linux refresh-sidebars  respawn sidebar panes after a code update
@@ -126,8 +139,12 @@ nmux-linux status          print session state + persisted open-set
 nmux-linux kill            kill the nmux-linux session (state is auto-saved)
 nmux-linux open <name|path>     open project as window (auto-registers if path)
 nmux-linux close-current        close current window (saves state)
-nmux-linux relayout             rebuild current window into sidebar | main | right(top/bot)
+nmux-linux relayout             rebuild current window into sidebar | main | right(top/bottom)
 nmux-linux fix-layout           re-pin sidebar width across windows (called by hooks)
+nmux-linux clean-omx-hud        remove definite stale omx HUD panes
+nmux-linux preview <url|cmd>    show preview in the managed top-right pane (alias: webview)
+nmux-linux preview --external <url>  open URL with xdg-open
+nmux-linux preview --cmd <cmd>       run a user command in the managed top-right pane
 nmux-linux disable-omx-hud      patch omx + write the HUD opt-out marker
 nmux-linux enable-omx-hud       remove marker (patches stay; harmless)
 nmux-linux save-state           persist current open-windows to state.json
@@ -137,6 +154,32 @@ nmux-linux notify --project N --status done|failed|need-input|running [--message
 nmux-linux notify-current --status ...   resolve project from current $TMUX pane
 nmux-linux clear-status --project N      reset status to idle (called by hooks on visit)
 ```
+
+
+### Right-pane preview / webview MVP
+
+`nmux-linux preview` (alias: `nmux-linux webview`) turns the existing
+managed top-right pane into a preview slot. It never creates another
+pane, and by default focus returns to the main coding pane.
+
+```bash
+# URL preview using the first installed terminal browser: w3m, lynx, elinks, links
+nmux-linux preview http://localhost:5173
+
+# Hand the URL to your desktop browser instead
+nmux-linux preview --external http://localhost:5173
+
+# Run any preview command in the managed top-right pane
+nmux-linux preview --cmd 'npm run dev -- --host 127.0.0.1'
+
+# Keep focus on the preview pane
+nmux-linux preview --focus http://localhost:5173
+```
+
+This is a terminal-native MVP, not a true GUI/Electron webview. Modern
+JS-heavy apps will usually need `--external` or a custom `--cmd`; richer
+cmux-style browser embedding is intentionally deferred until the
+terminal workflow is proven useful.
 
 In a running session:
 
@@ -150,11 +193,13 @@ In a running session:
 ## How it works
 
 - A single tmux session named `nmux-linux` holds one window per project.
-- Each window is laid out as **sidebar | main | right(top/bot)**.
+- Each window is laid out as **sidebar | main | right(top/bottom)**.
 - The sidebar pane runs `nmux-linux-sidebar`, which polls
   `tmux list-windows` every 0.5s, rewrites
-  `~/.config/nmux-linux/clickmap.txt` (mapping screen rows + column
-  ranges to actions), and persists the open-set.
+  `~/.config/nmux-linux/clickmaps/<pane>.txt` (mapping screen rows +
+  column ranges to actions), and persists the open-set. The renderer
+  avoids full clears after the first paint and wraps updates in terminal
+  synchronized-output markers when supported.
 - A `MouseDown1Pane` binding scoped to `pane_title=nmux-linux-sidebar`
   forwards `mouse_y` + `mouse_x` to `nmux-linux click <y> <x>`, which
   dispatches to switch / close / reopen / add / kill.
@@ -179,7 +224,7 @@ In a running session:
 ~/.bashrc.d/nmux-linux.sh          # tmux() shim
 ~/.config/nmux-linux/projects.json # registry
 ~/.config/nmux-linux/state.json    # open-set + lastActive
-~/.config/nmux-linux/clickmap.txt  # row → action map (rewritten 2 Hz)
+~/.config/nmux-linux/clickmaps/   # per-sidebar-pane row → action maps
 ~/.config/nmux-linux/disable-hud-omx  # omx HUD opt-out marker (if enabled)
 ```
 

@@ -72,18 +72,30 @@ got=$(tmux show-window-options -t "nmux-linux:1" @nmuxlinux_status 2>&1 | awk '{
 [ "$got" = "idle" ] || { echo "expected status=idle, got: $got"; exit 1; }
 echo "clear-status ok"
 
-step "9. open new project (auto-mkdir)"
+step "9. right-top preview command reuses existing pane"
+before=$(tmux list-panes -t nmux-linux:1 | wc -l)
+nmux-linux preview --cmd 'printf preview-ready; sleep 30'
+after=$(tmux list-panes -t nmux-linux:1 | wc -l)
+[ "$before" = "$after" ] || { echo "preview changed pane count: before=$before after=$after"; exit 1; }
+tmux list-panes -t nmux-linux:1 -F '#{pane_title}' | grep -qx 'webview' || { echo "webview pane title missing"; exit 1; }
+echo "preview ok"
+
+step "10. status includes pane details"
+nmux-linux status | grep -q 'webview' || { echo "status missing pane details"; exit 1; }
+echo "status pane details ok"
+
+step "11. open new project (auto-mkdir)"
 nmux-linux open "$HOME/projects/sample-c-fresh"
 test -d "$HOME/projects/sample-c-fresh" || { echo "auto-mkdir failed"; exit 1; }
 nmux-linux status
 
-step "10. close-window keeps session alive"
+step "12. close-window keeps session alive"
 LAST=$(tmux list-windows -t nmux-linux -F '#{window_index}' | tail -1)
 nmux-linux close-window "$LAST" || true
 sleep 0.5
 nmux-linux status
 
-step "11. kill teardown"
+step "13. kill teardown"
 nmux-linux kill
 tmux has-session -t nmux-linux 2>/dev/null && { echo "session still running"; exit 1; } || true
 

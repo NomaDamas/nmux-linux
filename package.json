@@ -1,0 +1,26 @@
+{
+  "name": "nmux-linux",
+  "version": "0.1.0",
+  "description": "Linux-native tmux front-end for multi-project agent workspaces.",
+  "license": "MIT",
+  "bin": {
+    "nmux-linux": "bin/nmux-linux",
+    "nmux-linux-sidebar": "bin/nmux-linux-sidebar"
+  },
+  "files": [
+    "bin/",
+    "share/",
+    "doc/",
+    "install.sh",
+    "uninstall.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node -c bin/nmux-linux && node -c bin/nmux-linux-sidebar && bash -n install.sh uninstall.sh test/smoke.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

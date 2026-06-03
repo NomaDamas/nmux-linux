@@ -54,7 +54,10 @@ detected) does three things:
 
 Both patches are idempotent — they detect their own marker tokens
 (`__nmuxlinux_existsSync`, `__nmuxlinux_hudSuppressed`) and no-op if
-already applied.
+already applied. At runtime, `nmux-linux fix-layout` also calls the same
+strict process-tree detector used by `nmux-linux clean-omx-hud` when the
+marker/env suppression switch is active, so stale `omx hud --watch`
+panes can be removed without touching unrelated panes.
 
 The omx package path is resolved at runtime by:
 
@@ -103,3 +106,25 @@ arg or hook target):
 - `alert-bell` — call `nmux-linux notify --project '#{@nmuxlinux_project}' --status done --message bell`.
 
 Disable bell-driven notify by `tmux set-window-option -g monitor-bell off`.
+
+
+## Right-pane preview / webview MVP
+
+`nmux-linux preview` and its alias `nmux-linux webview` reuse the
+existing managed top-right pane as a preview slot. They do not split
+tmux or create extra panes.
+
+Modes:
+
+- `nmux-linux preview <url>`: run the first available terminal browser
+  among `w3m`, `lynx`, `elinks`, and `links`.
+- `nmux-linux preview --external <url>`: use `xdg-open` and leave tmux
+  pane layout unchanged.
+- `nmux-linux preview --cmd <command>`: respawn the managed top-right pane with a
+  user-supplied command.
+- Add `--focus` to leave focus in the preview pane; otherwise focus
+  returns to the main pane.
+
+This is deliberately terminal-native. It is useful for simple HTML, logs,
+local server commands, and external browser handoff, but it is not a
+full GUI/Electron webview like cmux may provide.
