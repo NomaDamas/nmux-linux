@@ -292,7 +292,10 @@ function installBindings(session) {
     `set-hook -g client-attached "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
     `set-hook -g client-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
     `set-hook -g window-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g after-split-window "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    // Avoid after-split-window for fix-layout: layout repair itself uses
+    // split-window, so this hook can recurse and create duplicate status panes.
+    // Unset the old global hook installed by earlier nmux-linux versions.
+    `set-hook -gu after-split-window`,
 
     // Visiting a window clears its bell/done indicator (the ✓ in the sidebar).
     `set-hook -g after-select-window "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
@@ -877,16 +880,23 @@ function fixLayout() {
   // pane resize (we don't currently install them, but a no-op resize
   // still costs a fork+exec per sidebar per hook invocation).
   const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
-    '#{window_id}\t#{window_index}\t#{pane_id}\t#{pane_title}\t#{pane_pid}\t#{pane_width}\t#{@nmuxlinux_project}'],
+    '#{window_id}\t#{window_index}\t#{pane_id}\t#{pane_title}\t#{pane_pid}\t#{pane_width}\t#{window_width}\t#{window_height}\t#{@nmuxlinux_project}\t#{pane_current_path}\t#{pane_current_command}'],
     { allowFail: true });
   const byWin = new Map();
   for (const line of out.split('\n')) {
     if (!line) continue;
-    const [wid, widx, pid, title, ppid, widthStr, proj] = line.split('\t');
+    const [wid, widx, pid, title, ppid, widthStr, winWStr, winHStr, proj, paneCwd, paneCmd] = line.split('\t');
     const isSidebar = title === 'nmux-linux-sidebar' || isSidebarPid(ppid);
     const width = parseInt(widthStr, 10) || 0;
-    if (!byWin.has(wid)) byWin.set(wid, { idx: widx, proj, panes: [] });
-    byWin.get(wid).panes.push({ pid, title, isSidebar, width });
+    if (!byWin.has(wid)) byWin.set(wid, {
+      idx: widx,
+      proj,
+      paneCwd,
+      winW: parseInt(winWStr, 10),
+      winH: parseInt(winHStr, 10),
+      panes: [],
+    });
+    byWin.get(wid).panes.push({ pid, title, ppid, isSidebar, width, paneCwd, paneCmd });
   }
   for (const [, info] of byWin) {
     const sidebar = info.panes.find(p => p.isSidebar);
@@ -894,8 +904,66 @@ function fixLayout() {
       tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
     }
     rebuildMissingMain(cfg, info);
+    ensureTaskOverlay(cfg, info);
   }
   if (hudSuppressionActive()) killOmxHudPanes();
+}
+
+function paneRunsTaskOverlay(rootPid) {
+  if (!rootPid) return false;
+  const proc = readProcIndex();
+  const stack = [String(rootPid)];
+  const seen = new Set();
+  while (stack.length) {
+    const p = stack.pop();
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    const cmd = normalizeCmdline(proc.commands.get(p));
+    if (cmd.includes('nmux-linux task-overlay') || cmd.includes('task-overlay --cwd')) return true;
+    for (const child of proc.children.get(p) || []) stack.push(child);
+  }
+  return false;
+}
+
+function ensureTaskOverlay(cfg, info) {
+  if (!info || !info.panes.length || !info.proj) return;
+  // A webview pane intentionally owns the status slot until the user runs
+  // refresh-overlays/resize-cols, so don't overwrite it from fix-layout.
+  if (info.panes.some(p => paneRoleOf(p.title) === 'webview')) return;
+  const statuses = info.panes.filter(p => paneRoleOf(p.title) === 'status');
+  const status = statuses[0];
+  for (const extra of statuses.slice(1)) {
+    tmux(['kill-pane', '-t', extra.pid], { allowFail: true });
+  }
+  const project = (cfg.projects || []).find(p => p.name === info.proj);
+  const cwd = (project && project.cwd) || info.paneCwd || HOME;
+  if (status) {
+    if (!paneRunsTaskOverlay(status.ppid)) {
+      tmux(['respawn-pane', '-k', '-t', status.pid, '-c', cwd,
+        `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+        { allowFail: true });
+      tmux(['select-pane', '-t', status.pid, '-T', paneTitleFor(info.proj, 'status')],
+        { allowFail: true });
+    }
+    return;
+  }
+
+  const main = info.panes.find(p => paneRoleOf(p.title) === 'main')
+    || info.panes.find(p => !p.isSidebar && !isReservedPaneTitle(p.title));
+  if (!main) return;
+  const safeW = (Number.isFinite(info.winW) && info.winW > SIDEBAR_WIDTH + 120)
+    ? info.winW
+    : (SIDEBAR_WIDTH + 180);
+  const rightW = Math.max(24, Math.floor(safeW / 6));
+  const newPaneId = tmux(['split-window', '-t', main.pid, '-h', '-l', String(rightW), '-c', cwd,
+    '-P', '-F', '#{pane_id}',
+    `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+    { allowFail: true }).trim();
+  if (newPaneId) {
+    tmux(['select-pane', '-t', newPaneId, '-T', paneTitleFor(info.proj, 'status')],
+      { allowFail: true });
+    tmux(['select-pane', '-t', main.pid], { allowFail: true });
+  }
 }
 
 // If a window has a sidebar but no "main" project pane, the layout looks
@@ -1001,8 +1069,10 @@ function resizeCols() {
     const sidebar = info.panes.find(p => p.title === 'nmux-linux-sidebar');
     if (!sidebar) { skipped++; continue; }
     const nonSidebar = info.panes.filter(p => p.pid !== sidebar.pid);
-    const status = nonSidebar.find(p => paneRoleOf(p.title) === 'status');
-    const bash = nonSidebar.find(p => paneRoleOf(p.title) === 'bash');
+    const statuses = nonSidebar.filter(p => paneRoleOf(p.title) === 'status');
+    const bashes = nonSidebar.filter(p => paneRoleOf(p.title) === 'bash');
+    const status = statuses[0];
+    const bash = bashes[0];
     let sub = nonSidebar.find(p => paneRoleOf(p.title) === 'sub');
     // Main is whatever's left after extracting reserved roles.
     const main = nonSidebar.find(p => {
@@ -1024,8 +1094,8 @@ function resizeCols() {
 
     // Step 1: drop the right column (always — we rebuild it on the
     // correct side of sub). Drop sub too if we're on a 16:9 display.
-    if (status) tmux(['kill-pane', '-t', status.pid], { allowFail: true });
-    if (bash) tmux(['kill-pane', '-t', bash.pid], { allowFail: true });
+    for (const p of statuses) tmux(['kill-pane', '-t', p.pid], { allowFail: true });
+    for (const p of bashes) tmux(['kill-pane', '-t', p.pid], { allowFail: true });
     if (!wide && sub) {
       tmux(['kill-pane', '-t', sub.pid], { allowFail: true });
       sub = null;
@@ -1353,7 +1423,7 @@ const TASK_OVERLAY_TICK_MS = 2000;
 // Encode a cwd the way Claude Code names its project slugs: any `/`
 // or `.` becomes `-`. Anchor with a leading `-` so it matches the
 // directory naming on disk (e.g. /home/user/projects/example →
-// -home-cheol-projects-jikji).
+// -home-user-projects-example).
 function claudeSlugFor(cwd) {
   if (!cwd) return null;
   return cwd.replace(/[\/.]/g, '-');

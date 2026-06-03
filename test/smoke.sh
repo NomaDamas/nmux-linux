@@ -72,7 +72,17 @@ got=$(tmux show-window-options -t "nmux-linux:1" @nmuxlinux_status 2>&1 | awk '{
 [ "$got" = "idle" ] || { echo "expected status=idle, got: $got"; exit 1; }
 echo "clear-status ok"
 
-step "9. right-top preview command reuses existing pane"
+step "9. fix-layout restores missing task/status pane"
+status_pane=$(tmux list-panes -t nmux-linux:1 -F '#{pane_id}	#{pane_title}' | awk -F '\t' '$2 ~ /-status$/ {print $1; exit}')
+[ -n "$status_pane" ] || { echo "status pane missing before recovery test"; exit 1; }
+tmux kill-pane -t "$status_pane"
+nmux-linux fix-layout
+sleep 0.5
+restored=$(tmux list-panes -t nmux-linux:1 -F '#{pane_title}	#{pane_current_command}' | awk -F '\t' '$1 ~ /-status$/ && $2 == "node" {print $1; exit}')
+[ -n "$restored" ] || { echo "fix-layout did not restore node status pane"; tmux list-panes -t nmux-linux:1 -F '#{pane_id} #{pane_title} #{pane_current_command}'; exit 1; }
+echo "status recovery ok"
+
+step "10. right-top preview command reuses existing pane"
 before=$(tmux list-panes -t nmux-linux:1 | wc -l)
 nmux-linux preview --cmd 'printf preview-ready; sleep 30'
 after=$(tmux list-panes -t nmux-linux:1 | wc -l)
@@ -80,22 +90,22 @@ after=$(tmux list-panes -t nmux-linux:1 | wc -l)
 tmux list-panes -t nmux-linux:1 -F '#{pane_title}' | grep -qx 'webview' || { echo "webview pane title missing"; exit 1; }
 echo "preview ok"
 
-step "10. status includes pane details"
+step "11. status includes pane details"
 nmux-linux status | grep -q 'webview' || { echo "status missing pane details"; exit 1; }
 echo "status pane details ok"
 
-step "11. open new project (auto-mkdir)"
+step "12. open new project (auto-mkdir)"
 nmux-linux open "$HOME/projects/sample-c-fresh"
 test -d "$HOME/projects/sample-c-fresh" || { echo "auto-mkdir failed"; exit 1; }
 nmux-linux status
 
-step "12. close-window keeps session alive"
+step "13. close-window keeps session alive"
 LAST=$(tmux list-windows -t nmux-linux -F '#{window_index}' | tail -1)
 nmux-linux close-window "$LAST" || true
 sleep 0.5
 nmux-linux status
 
-step "13. kill teardown"
+step "14. kill teardown"
 nmux-linux kill
 tmux has-session -t nmux-linux 2>/dev/null && { echo "session still running"; exit 1; } || true
 
