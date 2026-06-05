@@ -4,11 +4,25 @@ const assert = require('node:assert/strict');
 const sidebar = require('../bin/nmux-linux-sidebar');
 
 test('parseRows decodes tmux list-windows output', () => {
-  const rows = sidebar.parseRows('1\tproj-a\t1\trunning\tproj-a\tbuild\n2\tproj-b\t0\tidle\t\t');
+  const rows = sidebar.parseRows('1\tproj-a\t1\trunning\tproj-a\tbuild\t123\n2\tproj-b\t0\tidle\t\t');
   assert.deepEqual(rows, [
-    { i: '1', n: 'proj-a', a: true, s: 'running', p: 'proj-a', m: 'build' },
+    { i: '1', n: 'proj-a', a: true, s: 'running', p: 'proj-a', m: 'build', statusAt: '123' },
     { i: '2', n: 'proj-b', a: false, s: 'idle', p: 'proj-b', m: '' },
   ]);
+});
+
+test('normalizeRows suppresses stale or unstamped running status', () => {
+  const now = 1_000_000;
+  const rows = sidebar.normalizeRows([
+    { i: '1', s: 'running', statusAt: String(now - 1000) },
+    { i: '2', s: 'running', statusAt: String(now - sidebar.RUNNING_STALE_MS - 1) },
+    { i: '3', s: 'running' },
+    { i: '4', s: 'failed' },
+  ], now);
+  assert.equal(rows[0].s, 'running');
+  assert.equal(rows[1].s, 'idle');
+  assert.equal(rows[2].s, 'idle');
+  assert.equal(rows[3].s, 'failed');
 });
 
 test('buildSidebarFrame is deterministic and keeps clickmap stable across spinner frames', () => {
