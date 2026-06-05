@@ -92,6 +92,23 @@ function which(bin) {
 }
 function shEsc(s) { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
 
+const RUNNING_STATUS_STALE_MS = 45_000;
+
+function setWindowStatus(target, status, message, opts = {}) {
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_status', status], opts);
+  if (message !== undefined) {
+    tmux(['set-window-option', '-t', target, '@nmuxlinux_message', String(message).slice(0, 120)], opts);
+  }
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_status_at', String(Date.now())], opts);
+}
+
+function runningStatusIsFresh(target) {
+  const atStr = tmux(['show-window-options', '-t', target, '-v', '@nmuxlinux_status_at'],
+    { allowFail: true }).trim();
+  const at = parseInt(atStr, 10);
+  return Number.isFinite(at) && at > 0 && Date.now() - at <= RUNNING_STATUS_STALE_MS;
+}
+
 // ---------- config / state ----------
 function ensureConfigDir() { fs.mkdirSync(CONFIG_DIR, { recursive: true }); }
 function loadConfig() {
@@ -334,8 +351,7 @@ function buildWindow(cfg, project, isFirst) {
   }
   const target = `${cfg.session}:${idx}`;
   tmux(['set-window-option', '-t', target, '@nmuxlinux_project', project.name]);
-  tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'idle']);
-  tmux(['set-window-option', '-t', target, '@nmuxlinux_message', '']);
+  setWindowStatus(target, 'idle', '');
   // strip tabs on this window
   tmux(['set-window-option', '-t', target, 'window-status-format', ' '], { allowFail: true });
   tmux(['set-window-option', '-t', target, 'window-status-current-format', ' '], { allowFail: true });
@@ -1239,7 +1255,8 @@ function confirmKill() {
 }
 
 function clickmapPathFor(paneId) {
-  return path.join(CLICKMAP_DIR, `${paneId || 'default'}.txt`);
+  const safePaneId = String(paneId || 'default').replace(/[^A-Za-z0-9_%-]/g, '_');
+  return path.join(CLICKMAP_DIR, `${safePaneId}.txt`);
 }
 
 // Append-only debug log for click events. The mouse binding now uses
@@ -1315,6 +1332,7 @@ function clickHandler(rowStr, colStr, paneId) {
           logClick(`switch switch-client target=${target} rc=${r.status} stderr=${(r.stderr || '').trim().slice(0, 200)}`);
         }
         focusMainPane(target);
+        clearStatusTarget(target);
         break;
       }
       case 'close':
@@ -2723,9 +2741,13 @@ function watchAgentsDaemon() {
       if (active) {
         prevQuietTicks.set(wid, 0);
         if (curStatus === 'idle' || curStatus === 'done' || curStatus === '') {
-          tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'running'],
-            { allowFail: true });
+          setWindowStatus(target, 'running', undefined, { allowFail: true });
           wlog(`w=${info.idx} idle→running agents=${agents.length} trigger=${trigger.join('|')}`);
+        } else if (curStatus === 'running') {
+          // Keep live running statuses fresh. Sidebars intentionally hide
+          // old/unstamped running options so a crashed watcher or legacy
+          // tmux option cannot animate forever.
+          setWindowStatus(target, 'running', undefined, { allowFail: true });
         }
       } else {
         const nq = prevQuiet + 1;
@@ -2735,8 +2757,7 @@ function watchAgentsDaemon() {
         // no longer flickers the indicator. Other states (need-input,
         // failed) are never overwritten by the watcher.
         if (curStatus === 'running' && nq >= QUIET_TICKS_TO_DONE) {
-          tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'done'],
-            { allowFail: true });
+          setWindowStatus(target, 'done', undefined, { allowFail: true });
           wlog(`w=${info.idx} running→done (quiet ${nq} ticks)`);
         }
       }
@@ -2821,8 +2842,7 @@ function notify({ project, status, message = '', session = SESSION }) {
   if (sessionExists(session)) {
     target = findWindowForProject(session, project);
     if (target) {
-      tmux(['set-window-option', '-t', target, '@nmuxlinux_status', status]);
-      tmux(['set-window-option', '-t', target, '@nmuxlinux_message', String(message).slice(0, 120)]);
+      setWindowStatus(target, status, message);
     }
   }
   // Log every notify so wrong-routing (e.g. PreToolUse from one Claude
@@ -2862,17 +2882,36 @@ function clearStatus(project) {
   if (!sessionExists(SESSION)) return;
   const target = findWindowForProject(SESSION, project);
   if (!target) return;
+  clearStatusTarget(target);
+}
+
+function clearStatusTarget(target) {
+  if (!target) return;
   // Preserve "running" across a window-visit. The after-select-window
   // hook fires clear-status on every visit, which is right for the
   // "I saw the ✓ / ✕ / ?" terminal states — the user has acknowledged
   // them, drop the indicator. But for "running" the spinner is the
-  // user's live signal that work is still in flight; dismissing it on
-  // visit would lie about the agent being idle.
+  // user's live signal that work is still in flight. Only fresh running
+  // statuses are preserved; old/unstamped ones are stale and were the
+  // source of permanent spinners and fast sidebar repainting.
   const cur = tmux(['show-window-options', '-t', target, '-v', '@nmuxlinux_status'],
     { allowFail: true }).trim();
-  if (cur === 'running') return;
-  tmux(['set-window-option', '-t', target, '@nmuxlinux_status', 'idle'], { allowFail: true });
-  tmux(['set-window-option', '-t', target, '@nmuxlinux_message', ''], { allowFail: true });
+  if (cur === 'running' && runningStatusIsFresh(target) && targetHasAgentProcess(target)) return;
+  setWindowStatus(target, 'idle', '', { allowFail: true });
+}
+
+function targetHasAgentProcess(target) {
+  const panes = tmux(['list-panes', '-t', target, '-F', '#{pane_pid}\t#{pane_title}'],
+    { allowFail: true });
+  if (!panes) return false;
+  const proc = readProcIndex();
+  for (const line of panes.split('\n')) {
+    if (!line) continue;
+    const [rootPid, title] = line.split('\t');
+    if (paneRoleOf(title) === 'sidebar') continue;
+    if (findAgentPidsInPane(rootPid, proc).length) return true;
+  }
+  return false;
 }
 
 function currentNmuxWindowTarget() {

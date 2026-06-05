@@ -124,10 +124,33 @@ function persistOpen(rows) {
 function parseRows(out) {
   return out
     ? out.split('\n').filter(Boolean).map(l => {
-      const [i, n, a, s, p, m] = l.split('\t');
-      return { i, n, a: a === '1', s, p: p || n, m };
+      const [i, n, a, s, p, m, statusAt] = l.split('\t');
+      const row = { i, n, a: a === '1', s, p: p || n, m };
+      if (statusAt) row.statusAt = statusAt;
+      return row;
     })
     : [];
+}
+
+const VALID_STATUSES = new Set(['idle', 'running', 'done', 'failed', 'need-input']);
+const RUNNING_STALE_MS = 45_000;
+
+function normalizeStatus(status, statusAt, now = Date.now()) {
+  const s = String(status || 'idle').trim() || 'idle';
+  if (!VALID_STATUSES.has(s)) return 'idle';
+  if (s !== 'running') return s;
+
+  const at = Number(statusAt);
+  // Older sessions did not stamp running transitions. Treat unstamped
+  // "running" as stale so a leftover tmux option cannot keep every
+  // sidebar in the fast spinner repaint loop forever.
+  if (!Number.isFinite(at) || at <= 0) return 'idle';
+  if (now - at > RUNNING_STALE_MS) return 'idle';
+  return 'running';
+}
+
+function normalizeRows(rows, now = Date.now()) {
+  return rows.map(r => ({ ...r, s: normalizeStatus(r.s, r.statusAt, now) }));
 }
 
 function buildSidebarFrame({ rows, registry, discover, width, frame = __frame }) {
@@ -317,8 +340,8 @@ function render({ forceScan = false } = {}) {
     refreshCaches(now, forceScan);
     selfCorrectWidth(now);
     const w = termWidth();
-    const fmt = '#{window_index}\t#{window_name}\t#{window_active}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}';
-    const rows = parseRows(t(['list-windows', '-t', SESSION, '-F', fmt]));
+    const fmt = '#{window_index}\t#{window_name}\t#{window_active}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}\t#{@nmuxlinux_status_at}';
+    const rows = normalizeRows(parseRows(t(['list-windows', '-t', SESSION, '-F', fmt])), now);
     __anyRunning = rows.some(r => r.s === 'running');
     const { body, clickmap } = buildSidebarFrame({
       rows,
@@ -328,14 +351,14 @@ function render({ forceScan = false } = {}) {
       frame: __frame,
     });
 
+    if (clickmap !== __lastClickmap) {
+      try { writeAtomic(CLICKMAP_PATH, clickmap); } catch {}
+      __lastClickmap = clickmap;
+    }
     if (body !== __lastBody) {
       process.stdout.write(terminalFrame(body));
       __firstPaint = false;
       __lastBody = body;
-    }
-    if (clickmap !== __lastClickmap) {
-      try { writeAtomic(CLICKMAP_PATH, clickmap); } catch {}
-      __lastClickmap = clickmap;
     }
     if (forceScan || now >= __nextStateAt) {
       persistOpen(rows);
@@ -412,4 +435,14 @@ function start() {
 }
 
 if (require.main === module) start();
-else module.exports = { buildSidebarFrame, icon, pad, parseRows, SPINNER, terminalFrame };
+else module.exports = {
+  buildSidebarFrame,
+  icon,
+  normalizeRows,
+  normalizeStatus,
+  pad,
+  parseRows,
+  RUNNING_STALE_MS,
+  SPINNER,
+  terminalFrame,
+};
