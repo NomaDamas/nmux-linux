@@ -78,7 +78,7 @@ function pad(text, w) {
       }
       cut += text[i]; plain += text[i]; i++;
     }
-    return cut + '…';
+    return cut + '…\x1b[0m';
   }
   return text + ' '.repeat(w - v);
 }
@@ -155,6 +155,15 @@ function normalizeRows(rows, now = Date.now()) {
 
 function buildSidebarFrame({ rows, registry, discover, width, frame = __frame }) {
   const w = width || 26;
+  // Keep every non-clickable chrome line to a single visual terminal row.
+  // If the sidebar is briefly narrower than its configured width (tmux can
+  // resize panes proportionally before our self-correction runs), an
+  // unconstrained header can soft-wrap and push the visible project rows down
+  // while the clickmap still contains the unwrapped row numbers. That makes a
+  // click land on the project above the one the user sees. Render chrome at
+  // w-1 cells, matching the project rows, so terminal autowrap never shifts
+  // click targets.
+  const lineW = Math.max(1, w - 1);
   const openNames = new Set(rows.map(r => (r.p || r.n).replace(/^[✓✕?…! ]+\s*/, '')));
   const closed = registry.filter(p => !openNames.has(p.name));
   const registryNames = new Set(registry.map(p => p.name));
@@ -163,8 +172,8 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
     .slice(0, DISCOVER_LIMIT);
 
   const lines = [];
-  lines.push('\x1b[1;38;5;46m nmux-linux\x1b[0m \x1b[2m· projects\x1b[0m');
-  lines.push('\x1b[2m' + '─'.repeat(Math.min(w - 1, 30)) + '\x1b[0m');
+  lines.push(pad('\x1b[1;38;5;46m nmux-linux\x1b[0m \x1b[2m· projects\x1b[0m', lineW));
+  lines.push('\x1b[2m' + '─'.repeat(Math.min(lineW, 30)) + '\x1b[0m');
 
   // Each entry: row<TAB>action<TAB>arg<TAB>colMin
   const map = [];
