@@ -225,8 +225,7 @@ function applyTmuxLines(lines) {
 function installBindings(session) {
   const lines = [
     // Session-level
-    `set-option -t ${session} status on`,
-    `set-option -t ${session} status-position top`,
+    `set-option -t ${session} status off`,
     `set-option -t ${session} base-index 1`,
     `set-option -t ${session} mouse on`,
 
@@ -234,12 +233,14 @@ function installBindings(session) {
     // (Per-window pane-border-format set in scrubWindowStatus.)
     `set-option -t ${session} pane-border-status top`,
 
-    // Sidebar already labels everything; keep the top bar minimal.
-    `set-option -t ${session} status on`,
+    // Sidebar already labels actions/projects, so hide tmux's global
+    // status line entirely. The old static hint ("click sidebar · prefix C…")
+    // looked like an unexplained top toolbar and its status area could still
+    // receive mouse focus/clicks.
     `set-option -t ${session} status-left ""`,
     `set-option -t ${session} status-left-length 0`,
-    `set-option -t ${session} status-right "#[fg=colour244]click sidebar · prefix C: new · prefix X: close#[default] "`,
-    `set-option -t ${session} status-right-length 80`,
+    `set-option -t ${session} status-right ""`,
+    `set-option -t ${session} status-right-length 0`,
     `set-option -t ${session} status-justify left`,
 
     // Tell omx to skip auto-spawning the HUD pane below — nmux-linux already owns
