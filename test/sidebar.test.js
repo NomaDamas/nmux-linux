@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const sidebar = require('../bin/nmux-linux-sidebar');
+const stripAnsi = s => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 
 test('parseRows decodes tmux list-windows output', () => {
   const rows = sidebar.parseRows('1\tproj-a\t1\trunning\tproj-a\tbuild\t123\n2\tproj-b\t0\tidle\t\t');
@@ -43,6 +44,21 @@ test('buildSidebarFrame is deterministic and keeps clickmap stable across spinne
   assert.match(a.clickmap, /^2\tswitch\t1\t0/m);
   assert.doesNotMatch(a.body, /\x1b\[2J/, 'frame body must not force a full clear');
   assert.match(a.body, /\x1b\[K/, 'frame body should clear to end of line');
+});
+
+test('buildSidebarFrame constrains top chrome to one row in narrow sidebars', () => {
+  const width = 16;
+  const out = sidebar.buildSidebarFrame({
+    rows: [{ i: '1', n: 'proj-a', a: true, s: 'idle', p: 'proj-a', m: '' }],
+    registry: [],
+    discover: [],
+    width,
+  });
+
+  const lines = out.body.split('\n');
+  assert.ok(stripAnsi(lines[0]).length <= width - 1, 'title header must not soft-wrap');
+  assert.ok(stripAnsi(lines[1]).length <= width - 1, 'title divider must not soft-wrap');
+  assert.match(out.clickmap, /^2\tswitch\t1\t0/m, 'first project row stays fixed below header');
 });
 
 test('terminalFrame wraps output in synchronized update sequence', () => {
