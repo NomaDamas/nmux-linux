@@ -61,6 +61,32 @@ test('buildSidebarFrame constrains top chrome to one row in narrow sidebars', ()
   assert.match(out.clickmap, /^2\tswitch\t1\t0/m, 'first project row stays fixed below header');
 });
 
+test('buildSidebarFrame hard-clips every visual line on very narrow sidebars', () => {
+  const width = 10;
+  const out = sidebar.buildSidebarFrame({
+    rows: [
+      { i: '1', n: 'very-long-project-name', a: true, s: 'running', p: 'very-long-project-name', m: '' },
+      { i: '2', n: 'another-long-project-name', a: false, s: 'idle', p: 'another-long-project-name', m: '' },
+    ],
+    registry: [{ name: 'closed-project-with-long-name' }],
+    discover: [{ name: 'discover-project-with-long-name' }],
+    width,
+  });
+
+  for (const line of out.body.split('\n')) {
+    assert.ok(stripAnsi(line).length <= width - 1, `line must not wrap: ${JSON.stringify(stripAnsi(line))}`);
+  }
+  assert.match(out.clickmap, /^2\tswitch\t1\t0/m);
+  assert.match(out.clickmap, /^3\tswitch\t2\t0/m);
+});
+
+test('responsiveSidebarWidth follows small/medium/large breakpoints', () => {
+  assert.equal(sidebar.responsiveSidebarWidth(60, 26), 16);
+  assert.equal(sidebar.responsiveSidebarWidth(90, 26), 20);
+  assert.equal(sidebar.responsiveSidebarWidth(140, 26), 26);
+  assert.equal(sidebar.responsiveSidebarWidth(140, 18), 18, 'user-configured narrower sidebar stays respected');
+});
+
 test('terminalFrame wraps output in synchronized update sequence', () => {
   const out = sidebar.terminalFrame('body');
   assert.ok(out.startsWith('\x1b[?2026h\x1b[2J\x1b[H'));

@@ -15,9 +15,80 @@ const STATE_PATH = path.join(CONFIG_DIR, 'state.json');
 const CLICKMAP_DIR = path.join(CONFIG_DIR, 'clickmaps');  // one file per sidebar pane
 const SESSION = 'nmux-linux';
 const SIDEBAR_WIDTH = 26;
-const RIGHT_PERCENT = 50;        // right column = 50% of remaining-after-sidebar
-                                 // → main pane covers sidebar→middle, right column covers middle→edge.
+const SIDEBAR_MIN_WIDTH = 16;
+const SIDEBAR_COMPACT_WIDTH = 20;
+const RIGHT_MIN_WIDTH = 16;
+const RIGHT_DEFAULT_MIN_WIDTH = 24;
+const SUB_MIN_WIDTH = 40;
 const SCAN_ROOTS = [path.join(HOME, 'projects'), path.join(HOME, 'projects', 'private')];
+
+function clampInt(n, min, max) {
+  const v = Math.floor(Number(n));
+  const lo = Math.floor(Number(min));
+  const hi = Math.floor(Number(max));
+  if (!Number.isFinite(v)) return lo;
+  return Math.max(lo, Math.min(hi, v));
+}
+
+// Keep the sidebar readable on large terminals but stop forcing 26 cells
+// into narrow clients. This same breakpoint logic is duplicated in the
+// sidebar helper so its self-correction does not fight fix-layout during
+// monitor/window-size changes.
+function responsiveSidebarWidth(winW, configured = SIDEBAR_WIDTH) {
+  const max = clampInt(configured || SIDEBAR_WIDTH, 12, 40);
+  const w = Number(winW);
+  if (!Number.isFinite(w) || w <= 0) return max;
+  if (w < 72) return Math.min(max, SIDEBAR_MIN_WIDTH);
+  if (w < 104) return Math.min(max, SIDEBAR_COMPACT_WIDTH);
+  return max;
+}
+
+function computeResponsiveLayout(winW, winH, configuredSidebar = SIDEBAR_WIDTH, opts = {}) {
+  const total = (Number.isFinite(Number(winW)) && Number(winW) > 0)
+    ? Math.floor(Number(winW))
+    : (Number(configuredSidebar) || SIDEBAR_WIDTH) + 140;
+  const sidebarWidth = responsiveSidebarWidth(total, configuredSidebar);
+  const hasRight = opts.hasRight !== false;
+  const hasSub = !!opts.hasSub;
+  const wantSub = !!opts.wantSub || hasSub;
+  const minMain = total < 80 ? 22 : (total < 120 ? 36 : 50);
+  const minRight = total < 80 ? RIGHT_MIN_WIDTH : (total < 112 ? 20 : RIGHT_DEFAULT_MIN_WIDTH);
+  const maxRight = total < 104 ? 24 : (total < 160 ? 32 : 48);
+  // tmux pane borders consume a few cells between columns. Keeping a small
+  // reserve prevents a mathematically-full plan from causing tmux to steal
+  // cells from the sidebar/main during resize.
+  const available = Math.max(1, total - sidebarWidth - 3);
+
+  let rightWidth = hasRight ? clampInt(Math.floor(total / 6), minRight, maxRight) : 0;
+  if (hasRight && available - rightWidth < minMain) {
+    rightWidth = Math.max(0, available - minMain);
+  }
+
+  const canFullSub = wantSub
+    && isWideAspect(total, Number(winH))
+    && available - rightWidth >= minMain + SUB_MIN_WIDTH;
+  let subWidth = 0;
+  if (canFullSub) {
+    subWidth = clampInt(Math.floor(total / 3), SUB_MIN_WIDTH, Math.floor(total * 0.34));
+  } else if (hasSub) {
+    // Preserve an existing auxiliary pane when moving from a large monitor to
+    // a small one, but collapse it to a harmless sliver so main+status remain
+    // usable. We do not kill panes from an automatic resize hook.
+    subWidth = Math.min(12, Math.max(0, available - rightWidth - minMain));
+    if (subWidth < 6) subWidth = 0;
+  }
+
+  if (available - rightWidth - subWidth < minMain) {
+    subWidth = Math.max(0, available - rightWidth - minMain);
+  }
+  if (available - rightWidth - subWidth < minMain) {
+    rightWidth = Math.max(0, available - subWidth - minMain);
+  }
+  if (hasRight) rightWidth = Math.max(1, rightWidth);
+  const mainWidth = Math.max(1, available - rightWidth - subWidth);
+  const mode = total < 104 ? 'small' : (canFullSub ? 'wide' : 'medium');
+  return { mode, total, sidebarWidth, mainWidth, rightWidth, subWidth, canFullSub };
+}
 
 // Resolve own install location from argv[1] so a non-default --prefix
 // (e.g. /opt/nmux-linux/bin/nmux-linux) still spawns the right helper.
@@ -366,8 +437,18 @@ function buildLayout(cfg, target, project, cwd, shell) {
   // Title the active pane (main shell created by new-window/new-session).
   tmux(['select-pane', '-t', target, '-T', paneTitleFor(project.name, 'main')], { allowFail: true });
 
+  const winInfo = tmux(['display-message', '-p', '-t', target,
+    '#{window_width}\t#{window_height}'], { allowFail: true }).trim();
+  const [wwStr, whStr] = winInfo.split('\t');
+  const winW = parseInt(wwStr, 10);
+  const winH = parseInt(whStr, 10);
+  const plan = computeResponsiveLayout(winW, winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+    hasRight: true,
+    wantSub: isWideAspect(winW, winH),
+  });
+
   // Split LEFT for sidebar (fixed cells).
-  tmux(['split-window', '-t', target, '-b', '-h', '-l', String(cfg.sidebarWidth || SIDEBAR_WIDTH),
+  tmux(['split-window', '-t', target, '-b', '-h', '-l', String(plan.sidebarWidth),
         '-c', cwd,
         `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
   tmux(['select-pane', '-t', target, '-T', 'nmux-linux-sidebar'], { allowFail: true });
@@ -381,24 +462,13 @@ function buildLayout(cfg, target, project, cwd, shell) {
   //   reclaim that space for main.
   //   wide  : main = W/2 - sw,        status = W/6, sub = W/3
   //   16:9  : main = W - sw - status, status = W/6
-  const winInfo = tmux(['display-message', '-p', '-t', target,
-    '#{window_width}\t#{window_height}'], { allowFail: true }).trim();
-  const [wwStr, whStr] = winInfo.split('\t');
-  const winW = parseInt(wwStr, 10);
-  const winH = parseInt(whStr, 10);
-  const sw = cfg.sidebarWidth || SIDEBAR_WIDTH;
-  const wide = isWideAspect(winW, winH);
-  const safeW = (Number.isFinite(winW) && winW > sw + 120) ? winW : (sw + 180);
-  const rightW = Math.max(24, Math.floor(safeW / 6));
-  const subW = wide ? Math.max(40, Math.floor(safeW / 3)) : 0;
-
   const TITLE_SUB = paneTitleFor(project.name, 'sub');
   const TITLE_STATUS = paneTitleFor(project.name, 'status');
   const TITLE_BASH = paneTitleFor(project.name, 'bash');
 
-  if (wide) {
+  if (plan.subWidth > 0) {
     // Step 1: from main, split → sub at far right.
-    tmux(['split-window', '-t', target, '-h', '-l', String(subW), '-c', cwd, shell],
+    tmux(['split-window', '-t', target, '-h', '-l', String(plan.subWidth), '-c', cwd, shell],
       { allowFail: true });
     tmux(['select-pane', '-t', target, '-T', TITLE_SUB], { allowFail: true });
     tmux(['select-pane', '-t', target, '-L'], { allowFail: true });
@@ -406,7 +476,7 @@ function buildLayout(cfg, target, project, cwd, shell) {
 
   // Step 2: from main, split → status pane (status column ends up
   // between main and sub on wide, or at the far right on 16:9).
-  tmux(['split-window', '-t', target, '-h', '-l', String(rightW), '-c', cwd,
+  tmux(['split-window', '-t', target, '-h', '-l', String(plan.rightWidth), '-c', cwd,
         `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
     { allowFail: true });
   tmux(['select-pane', '-t', target, '-T', TITLE_STATUS], { allowFail: true });
@@ -463,14 +533,22 @@ function relayoutCurrent() {
   }
   if (!sidebar) {
     // Recreate sidebar on the LEFT
-    tmux(['split-window', '-t', main.pid, '-b', '-h', '-l', String(cfg.sidebarWidth || SIDEBAR_WIDTH),
+    const winInfo = tmux(['display-message', '-p', '-t', target,
+      '#{window_width}\t#{window_height}'], { allowFail: true }).trim();
+    const [ww, wh] = winInfo.split('\t').map(n => parseInt(n, 10));
+    const plan = computeResponsiveLayout(ww, wh, cfg.sidebarWidth || SIDEBAR_WIDTH, { hasRight: true });
+    tmux(['split-window', '-t', main.pid, '-b', '-h', '-l', String(plan.sidebarWidth),
           '-c', cwd,
           `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
     tmux(['select-pane', '-t', target, '-T', 'nmux-linux-sidebar'], { allowFail: true });
     tmux(['select-pane', '-t', main.pid], { allowFail: true });
   } else {
     // Resize sidebar back to configured width.
-    tmux(['resize-pane', '-t', sidebar.pid, '-x', String(cfg.sidebarWidth || SIDEBAR_WIDTH)], { allowFail: true });
+    const winInfo = tmux(['display-message', '-p', '-t', target,
+      '#{window_width}\t#{window_height}'], { allowFail: true }).trim();
+    const [ww, wh] = winInfo.split('\t').map(n => parseInt(n, 10));
+    const plan = computeResponsiveLayout(ww, wh, cfg.sidebarWidth || SIDEBAR_WIDTH, { hasRight: true });
+    tmux(['resize-pane', '-t', sidebar.pid, '-x', String(plan.sidebarWidth)], { allowFail: true });
   }
   // Mirror buildLayout exactly: sidebar | main | status/bash [| sub]
   tmux(['select-pane', '-t', main.pid, '-T', paneTitleFor(projName, 'main')],
@@ -479,19 +557,18 @@ function relayoutCurrent() {
   const winInfoR = tmux(['display-message', '-p', '-t', target,
     '#{window_width}\t#{window_height}'], { allowFail: true }).trim();
   const [wwR, whR] = winInfoR.split('\t').map(n => parseInt(n, 10));
-  const swR = cfg.sidebarWidth || SIDEBAR_WIDTH;
-  const wideR = isWideAspect(wwR, whR);
-  const safeWR = (Number.isFinite(wwR) && wwR > swR + 120) ? wwR : (swR + 180);
-  const rightWR = Math.max(24, Math.floor(safeWR / 6));
-  const subWR = wideR ? Math.max(40, Math.floor(safeWR / 3)) : 0;
-  if (wideR) {
-    tmux(['split-window', '-t', main.pid, '-h', '-l', String(subWR), '-c', cwd, shell],
+  const planR = computeResponsiveLayout(wwR, whR, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+    hasRight: true,
+    wantSub: isWideAspect(wwR, whR),
+  });
+  if (planR.subWidth > 0) {
+    tmux(['split-window', '-t', main.pid, '-h', '-l', String(planR.subWidth), '-c', cwd, shell],
       { allowFail: true });
     tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'sub')],
       { allowFail: true });
     tmux(['select-pane', '-t', main.pid], { allowFail: true });
   }
-  tmux(['split-window', '-t', main.pid, '-h', '-l', String(rightWR), '-c', cwd,
+  tmux(['split-window', '-t', main.pid, '-h', '-l', String(planR.rightWidth), '-c', cwd,
     `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
     { allowFail: true });
   tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'status')],
@@ -884,18 +961,47 @@ function hudSuppressionActive() {
   return false;
 }
 
+function resizePaneWidth(pid, width, currentWidth) {
+  const w = Math.max(1, Math.floor(Number(width) || 1));
+  if (!pid) return;
+  if (Number.isFinite(currentWidth) && Math.abs(currentWidth - w) <= 1) return;
+  tmux(['resize-pane', '-t', pid, '-x', String(w)], { allowFail: true });
+}
+
+function convergeResponsiveWindowLayout(cfg, info) {
+  if (!info || !info.panes || !info.panes.length) return;
+  const sidebar = info.panes.find(p => p.isSidebar);
+  const main = info.panes.find(p => paneRoleOf(p.title) === 'main')
+    || info.panes.find(p => !p.isSidebar && !isReservedPaneTitle(p.title));
+  const status = info.panes.find(p => paneRoleOf(p.title) === 'status')
+    || info.panes.find(p => paneRoleOf(p.title) === 'webview');
+  const bash = info.panes.find(p => paneRoleOf(p.title) === 'bash');
+  const sub = info.panes.find(p => paneRoleOf(p.title) === 'sub');
+  const plan = computeResponsiveLayout(info.winW, info.winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+    hasRight: !!(status || bash),
+    hasSub: !!sub,
+    wantSub: isWideAspect(info.winW, info.winH),
+  });
+
+  // Two passes converge better because tmux redistributes cells from
+  // neighbouring panes on every absolute resize.
+  for (let pass = 0; pass < 2; pass++) {
+    if (sidebar) resizePaneWidth(sidebar.pid, plan.sidebarWidth, sidebar.width);
+    if (main) resizePaneWidth(main.pid, plan.mainWidth, main.width);
+    if (sub) resizePaneWidth(sub.pid, plan.subWidth || 1, sub.width);
+    if (status) resizePaneWidth(status.pid, plan.rightWidth || 1, status.width);
+    if (bash) resizePaneWidth(bash.pid, plan.rightWidth || 1, bash.width);
+  }
+}
+
 function fixLayout() {
-  // tmux scales panes proportionally on resize; pin sidebar back to its
-  // configured cell-width across all nmux-linux windows. Also ensures right
-  // column halves the post-sidebar area so main is sidebar→middle.
+  // tmux scales panes proportionally on resize; converge every nmux-linux
+  // window back to a monitor-size-aware layout. Small clients get a narrower
+  // sidebar and collapsed auxiliary pane; wide clients keep the larger
+  // proportions. Automatic resize never kills panes.
   if (process.env.NMUX_LINUX_HOOK_SESSION && process.env.NMUX_LINUX_HOOK_SESSION !== SESSION) return;
   if (!sessionExists(SESSION)) return;
   const cfg = loadConfig() || initConfig();
-  const sw = Number(cfg.sidebarWidth) || SIDEBAR_WIDTH;
-  // Pull current widths so we can SKIP resize-pane when the sidebar is
-  // already correctly sized. Without this guard, hooks that fire on
-  // pane resize (we don't currently install them, but a no-op resize
-  // still costs a fork+exec per sidebar per hook invocation).
   const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
     '#{window_id}\t#{window_index}\t#{pane_id}\t#{pane_title}\t#{pane_pid}\t#{pane_width}\t#{window_width}\t#{window_height}\t#{@nmuxlinux_project}\t#{pane_current_path}\t#{pane_current_command}'],
     { allowFail: true });
@@ -916,12 +1022,9 @@ function fixLayout() {
     byWin.get(wid).panes.push({ pid, title, ppid, isSidebar, width, paneCwd, paneCmd });
   }
   for (const [, info] of byWin) {
-    const sidebar = info.panes.find(p => p.isSidebar);
-    if (sidebar && sidebar.width !== sw) {
-      tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
-    }
     rebuildMissingMain(cfg, info);
     ensureTaskOverlay(cfg, info);
+    convergeResponsiveWindowLayout(cfg, info);
   }
   if (hudSuppressionActive()) killOmxHudPanes();
 }
@@ -968,11 +1071,11 @@ function ensureTaskOverlay(cfg, info) {
   const main = info.panes.find(p => paneRoleOf(p.title) === 'main')
     || info.panes.find(p => !p.isSidebar && !isReservedPaneTitle(p.title));
   if (!main) return;
-  const safeW = (Number.isFinite(info.winW) && info.winW > SIDEBAR_WIDTH + 120)
-    ? info.winW
-    : (SIDEBAR_WIDTH + 180);
-  const rightW = Math.max(24, Math.floor(safeW / 6));
-  const newPaneId = tmux(['split-window', '-t', main.pid, '-h', '-l', String(rightW), '-c', cwd,
+  const plan = computeResponsiveLayout(info.winW, info.winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+    hasRight: true,
+    hasSub: info.panes.some(p => paneRoleOf(p.title) === 'sub'),
+  });
+  const newPaneId = tmux(['split-window', '-t', main.pid, '-h', '-l', String(plan.rightWidth || 1), '-c', cwd,
     '-P', '-F', '#{pane_id}',
     `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
     { allowFail: true }).trim();
@@ -1008,7 +1111,11 @@ function rebuildMissingMain(cfg, info) {
   // focusMainPane calls can locate it.
   if (newPaneId) tmux(['select-pane', '-t', newPaneId, '-T', paneTitleFor(projName, 'main')], { allowFail: true });
   // Re-pin the sidebar — the split shrank it by half.
-  const sw = Number(cfg.sidebarWidth) || SIDEBAR_WIDTH;
+  const plan = computeResponsiveLayout(info.winW, info.winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+    hasRight: info.panes.some(p => paneRoleOf(p.title) === 'status' || paneRoleOf(p.title) === 'bash'),
+    hasSub: info.panes.some(p => paneRoleOf(p.title) === 'sub'),
+  });
+  const sw = plan.sidebarWidth;
   tmux(['resize-pane', '-t', sidebar.pid, '-x', String(sw)], { allowFail: true });
   // The new main is half of the original sidebar (≈13 cells). Grow it to
   // roughly (window_width - sidebar)/2 so the layout matches a freshly
@@ -1019,7 +1126,11 @@ function rebuildMissingMain(cfg, info) {
       '#{window_width}'], { allowFail: true }).trim();
     const winW = parseInt(winInfo, 10);
     if (Number.isFinite(winW) && winW > sw + 4) {
-      const mainW = Math.max(20, Math.floor((winW - sw) / 2));
+      const mainPlan = computeResponsiveLayout(winW, info.winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+        hasRight: info.panes.some(p => paneRoleOf(p.title) === 'status' || paneRoleOf(p.title) === 'bash'),
+        hasSub: info.panes.some(p => paneRoleOf(p.title) === 'sub'),
+      });
+      const mainW = Math.max(20, mainPlan.mainWidth);
       tmux(['resize-pane', '-t', newPaneId, '-x', String(mainW)], { allowFail: true });
     }
   }
@@ -1067,7 +1178,6 @@ function refreshOverlays() {
 function resizeCols() {
   if (!sessionExists(SESSION)) return;
   const cfg = loadConfig() || initConfig();
-  const sw = cfg.sidebarWidth || SIDEBAR_WIDTH;
   const shell = process.env.SHELL || '/bin/bash';
   const out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
     '#{window_index}\t#{pane_id}\t#{pane_title}\t#{window_width}\t#{window_height}\t#{@nmuxlinux_project}\t#{pane_current_path}'],
@@ -1101,13 +1211,16 @@ function resizeCols() {
     if (!projName) { skipped++; continue; }
     const project = (cfg.projects || []).find(p => p.name === projName);
     const cwd = (project && project.cwd) || info.paneCwd || HOME;
-    const wide = isWideAspect(info.winW, info.winH);
-    const safeW = (Number.isFinite(info.winW) && info.winW > sw + 120) ? info.winW : (sw + 180);
-    const rightW = Math.max(24, Math.floor(safeW / 6));
-    const subW = wide ? Math.max(40, Math.floor(safeW / 3)) : 0;
-    const mainW = Math.max(40, wide
-      ? Math.floor(safeW / 2) - sw
-      : (safeW - sw - rightW - 1));
+    const plan = computeResponsiveLayout(info.winW, info.winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+      hasRight: true,
+      hasSub: !!sub,
+      wantSub: isWideAspect(info.winW, info.winH),
+    });
+    const sw = plan.sidebarWidth;
+    const wide = plan.canFullSub;
+    const rightW = plan.rightWidth || 1;
+    const subW = plan.subWidth || 0;
+    const mainW = Math.max(20, plan.mainWidth);
 
     // Step 1: drop the right column (always — we rebuild it on the
     // correct side of sub). Drop sub too if we're on a 16:9 display.
@@ -3243,6 +3356,8 @@ if (require.main === module) {
 } else {
   module.exports = {
     clipDisplayText,
+    computeResponsiveLayout,
+    responsiveSidebarWidth,
     statusKoreanLabel,
     renderTaskOverlaySummaryLines,
     renderNoTaskFallbackLines,

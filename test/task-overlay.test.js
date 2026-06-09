@@ -26,3 +26,28 @@ test('overlay text clipping is deterministic', () => {
   assert.equal(overlay.clipDisplayText('abcdef', 4), 'abc…');
   assert.equal(overlay.clipDisplayText('abc', 4), 'abc');
 });
+
+test('responsive layout uses compact stable widths on small screens', () => {
+  const p = overlay.computeResponsiveLayout(80, 24, 26, { hasRight: true, wantSub: true });
+  assert.equal(p.mode, 'small');
+  assert.equal(p.sidebarWidth, 20);
+  assert.equal(p.subWidth, 0);
+  assert.ok(p.mainWidth >= 36);
+  assert.ok(p.rightWidth >= 16);
+});
+
+test('responsive layout keeps full auxiliary column on wide screens', () => {
+  const p = overlay.computeResponsiveLayout(260, 45, 26, { hasRight: true, wantSub: true });
+  assert.equal(p.mode, 'wide');
+  assert.equal(p.sidebarWidth, 26);
+  assert.ok(p.subWidth >= 40);
+  assert.ok(p.mainWidth > p.subWidth);
+  assert.ok(p.rightWidth >= 24);
+});
+
+test('responsive layout collapses an existing sub pane instead of killing small-screen usability', () => {
+  const p = overlay.computeResponsiveLayout(92, 28, 26, { hasRight: true, hasSub: true });
+  assert.equal(p.sidebarWidth, 20);
+  assert.ok(p.subWidth <= 12);
+  assert.ok(p.mainWidth >= 36);
+});

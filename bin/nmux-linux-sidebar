@@ -19,6 +19,26 @@ const CLICKMAP_DIR = path.join(CONFIG_DIR, 'clickmaps');
 const PANE_ID = (process.env.TMUX_PANE || 'default').replace(/[^A-Za-z0-9_%-]/g, '_');
 const CLICKMAP_PATH = path.join(CLICKMAP_DIR, `${PANE_ID}.txt`);
 const SCAN_ROOTS = [path.join(os.homedir(), 'projects')];
+const DEFAULT_SIDEBAR_WIDTH = 26;
+const SIDEBAR_MIN_WIDTH = 16;
+const SIDEBAR_COMPACT_WIDTH = 20;
+
+function clampInt(n, min, max) {
+  const v = Math.floor(Number(n));
+  const lo = Math.floor(Number(min));
+  const hi = Math.floor(Number(max));
+  if (!Number.isFinite(v)) return lo;
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function responsiveSidebarWidth(winW, configured = DEFAULT_SIDEBAR_WIDTH) {
+  const max = clampInt(configured || DEFAULT_SIDEBAR_WIDTH, 12, 40);
+  const w = Number(winW);
+  if (!Number.isFinite(w) || w <= 0) return max;
+  if (w < 72) return Math.min(max, SIDEBAR_MIN_WIDTH);
+  if (w < 104) return Math.min(max, SIDEBAR_COMPACT_WIDTH);
+  return max;
+}
 
 // Atomic write helper — same pattern used by the main nmux-linux script.
 function writeAtomic(filePath, content) {
@@ -164,6 +184,7 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
   // w-1 cells, matching the project rows, so terminal autowrap never shifts
   // click targets.
   const lineW = Math.max(1, w - 1);
+  const rowTextW = Math.max(1, w - 3);
   const openNames = new Set(rows.map(r => (r.p || r.n).replace(/^[✓✕?…! ]+\s*/, '')));
   const closed = registry.filter(p => !openNames.has(p.name));
   const registryNames = new Set(registry.map(p => p.name));
@@ -192,13 +213,13 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
       // background color. Stays loud until the user visits the window
       // (after-select-window → nmux-linux clear-status resets it).
       const inner = `${arrow}${idxs} ${ic} ${name}`;
-      const padded = pad(inner, w - 3);
+      const padded = pad(inner, rowTextW);
       // Render close × in the same row block but with explicit fg/bg
       // so it stays readable on the colored background.
       lines.push(style.open + padded + ' ×' + style.close);
     } else {
       const left = `${style.open}${arrow}${idxs} ${ic} ${name}${style.close}`;
-      const padded = pad(left, w - 3);
+      const padded = pad(left, rowTextW);
       const closeMark = r.a ? ' \x1b[1;31m×\x1b[0m' : ' \x1b[2;31m×\x1b[0m';
       lines.push(padded + closeMark);
     }
@@ -251,14 +272,14 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
 
   // hints
   lines.push('');
-  lines.push('\x1b[2m click row=switch');
-  lines.push(' × close window');
-  lines.push(' M-1..9 keys');
-  lines.push(' prefix C: new');
-  lines.push(' prefix X: close\x1b[0m');
+  lines.push('\x1b[2m' + pad(' click row=switch', lineW) + '\x1b[0m');
+  lines.push('\x1b[2m' + pad(' × close window', lineW) + '\x1b[0m');
+  lines.push('\x1b[2m' + pad(' M-1..9 keys', lineW) + '\x1b[0m');
+  lines.push('\x1b[2m' + pad(' prefix C: new', lineW) + '\x1b[0m');
+  lines.push('\x1b[2m' + pad(' prefix X: close', lineW) + '\x1b[0m');
 
   return {
-    body: lines.map(line => line + '\x1b[K').join('\n') + '\n\x1b[J',
+    body: lines.map(line => pad(line, lineW) + '\x1b[K').join('\n') + '\n\x1b[J',
     clickmap: map.join('\n') + '\n',
   };
 }
@@ -298,18 +319,32 @@ function refreshCaches(now, force = false) {
   __nextScanAt = now + SCAN_INTERVAL_MS;
 }
 
-// Configured sidebar width (cells). Falls back to 26 when projects.json
-// is unreadable. Cached for the lifetime of the sidebar process — width
-// changes require a refresh-sidebars anyway.
-let __expectedWidthCache = null;
-function expectedWidth() {
-  if (__expectedWidthCache != null) return __expectedWidthCache;
+// Configured max sidebar width (cells). The actual expected width is
+// responsive to the tmux window width so this pane does not fight
+// nmux-linux fix-layout when a small monitor/client attaches.
+let __configuredWidthCache = null;
+function configuredWidth() {
+  if (__configuredWidthCache != null) return __configuredWidthCache;
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
     const w = Number(cfg.sidebarWidth);
-    __expectedWidthCache = Number.isFinite(w) && w > 0 ? w : 26;
-  } catch { __expectedWidthCache = 26; }
-  return __expectedWidthCache;
+    __configuredWidthCache = Number.isFinite(w) && w > 0 ? w : DEFAULT_SIDEBAR_WIDTH;
+  } catch { __configuredWidthCache = DEFAULT_SIDEBAR_WIDTH; }
+  return __configuredWidthCache;
+}
+
+function tmuxWindowWidthForPane(pane) {
+  if (!pane) return 0;
+  const r = spawnSync('tmux', ['display-message', '-p', '-t', pane, '#{window_width}'], { encoding: 'utf8' });
+  if (r.status !== 0) return 0;
+  const w = parseInt((r.stdout || '').trim(), 10);
+  return Number.isFinite(w) ? w : 0;
+}
+
+function expectedWidth() {
+  const pane = process.env.TMUX_PANE;
+  const winW = tmuxWindowWidthForPane(pane);
+  return responsiveSidebarWidth(winW, configuredWidth());
 }
 
 // Defense in depth: tmux hooks pin the sidebar width on common events,
@@ -329,7 +364,10 @@ function selfCorrectWidth(now) {
   }
   if (now - __lastWidthChangeAt < RESIZE_QUIET_MS) return;
   const want = expectedWidth();
-  if (cur === want) return;
+  // tmux can leave a pane one cell wider/narrower after accounting for
+  // borders. Treat ±1 as converged; repeatedly forcing that last cell is the
+  // exact resize tug-of-war that shows up as sidebar flicker on small screens.
+  if (Math.abs(cur - want) <= 1) return;
   const pane = process.env.TMUX_PANE;
   if (!pane) return;
   spawnSync('tmux', ['resize-pane', '-t', pane, '-x', String(want)], { stdio: 'ignore' });
@@ -451,6 +489,7 @@ else module.exports = {
   normalizeStatus,
   pad,
   parseRows,
+  responsiveSidebarWidth,
   RUNNING_STALE_MS,
   SPINNER,
   terminalFrame,
