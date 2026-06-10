@@ -51,3 +51,27 @@ test('responsive layout collapses an existing sub pane instead of killing small-
   assert.ok(p.subWidth <= 12);
   assert.ok(p.mainWidth >= 36);
 });
+
+test('sanitizeTitle drops kitty-graphics APC blobs that leak into pane_title', () => {
+  // Bare kitty-graphics payload (issue #7): collapses to empty so it can't
+  // be mis-routed or echoed back as a wall of garbage.
+  assert.equal(overlay.sanitizeTitle('Gm=0;CCGEEMKQNieEEEAAAA=='), '');
+  assert.equal(overlay.sanitizeTitle('Ga=T,f=100,s=10;iVBORw0KGgo='), '');
+  // Wrapped APC escape sequence is stripped entirely.
+  assert.equal(overlay.sanitizeTitle('\x1b_Gm=0;AAAA\x1b\\'), '');
+  // Raw control bytes are removed.
+  assert.equal(overlay.sanitizeTitle('foo\x07\x1b[31mbar'), 'foobar');
+  // Legitimate titles are preserved untouched.
+  assert.equal(overlay.sanitizeTitle('nmux-linux-sidebar'), 'nmux-linux-sidebar');
+  assert.equal(overlay.sanitizeTitle('myproject-status'), 'myproject-status');
+  assert.equal(overlay.sanitizeTitle(''), '');
+});
+
+test('graphics-blob title resolves to main pane, not a reserved role', () => {
+  const garbage = overlay.sanitizeTitle('Gm=0;x2XSXhJCCCGEEDK');
+  // Empty after sanitizing → paneRoleOf returns null → treated as the main pane.
+  assert.equal(overlay.paneRoleOf(garbage), null);
+  // Trusted titles still route correctly.
+  assert.equal(overlay.paneRoleOf('nmux-linux-sidebar'), 'sidebar');
+  assert.equal(overlay.paneRoleOf('proj-status'), 'status');
+});

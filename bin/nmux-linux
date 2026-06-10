@@ -259,8 +259,15 @@ function scrubWindowStatus(session) {
   // titles (main = project, right-top, right-bot). The conditional
   // pane-border-format below renders an empty bar specifically for the
   // sidebar pane only.
+  // Some agents emit kitty-graphics / base64 blobs that land in pane_title and then
+  // render as a wall of garbage across this border on every redraw (the
+  // user sees "weird characters in a row" when scrolling or clicking the agent
+  // pane). Guard the title: when it matches a kitty-graphics APC payload shape
+  // (`G<key>=...;...`, e.g. `Gm=0;<base64>`) fall back to the trusted project
+  // name kept in @nmuxlinux_project instead of echoing the raw escape bytes.
+  const safeTitle = '#{?#{m:G?=*;*,#{pane_title}},#{@nmuxlinux_project},#{pane_title}}';
   const sidebarFmt = ' #[bold]#{?pane_active,#[fg=colour46],#[fg=colour244]}'
-    + '#{?#{==:#{pane_title},nmux-linux-sidebar}, ,#P · #{pane_title}}#[default] ';
+    + `#{?#{==:#{pane_title},nmux-linux-sidebar}, ,#P · ${safeTitle}}#[default] `;
   for (const idx of listWindowIndices(session)) {
     const target = `${session}:${idx}`;
     tmux(['set-window-option', '-t', target, 'window-status-format', ' '], { allowFail: true });
@@ -2899,6 +2906,26 @@ function paneTitleFor(project, role) {
   if (!project || !PANE_ROLE_SUFFIX[role]) return '';
   return project + PANE_ROLE_SUFFIX[role];
 }
+// Strip escape/control noise out of a pane_title before we use it for role
+// routing. Some agents emit kitty-graphics APC sequences (`\e_G...\e\\`) that
+// the host terminal/tmux fails to consume, so the raw payload (`Gm=0;<base64>`,
+// or leftover ESC/control bytes) ends up parked in #{pane_title}. Feeding that
+// straight into paneRoleOf is what leaks the "wall of garbage". Drop control
+// bytes and collapse a bare kitty-graphics payload to empty so it resolves to
+// the main pane (role null) cleanly.
+function sanitizeTitle(title) {
+  if (!title) return '';
+  let s = String(title)
+    // OSC / DCS / APC / PM / SOS and lone ESC sequences.
+    .replace(/\x1b[\]_^PX][\s\S]*?(?:\x1b\\|\x07|$)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '')
+    .replace(/\x1b./g, '')
+    // Any remaining C0/C1 control bytes.
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+  // Bare kitty-graphics APC payload that leaked into the title verbatim.
+  if (/^G[A-Za-z]=[^;]*;/.test(s)) return '';
+  return s;
+}
 function paneRoleOf(title) {
   if (!title) return null;
   if (title === 'nmux-linux-sidebar') return 'sidebar';
@@ -3265,7 +3292,7 @@ function main() {
     //   else      → just select the pane
     const pid = args._[1];
     const sess = args._[2];
-    const title = args._[3];
+    const title = sanitizeTitle(args._[3]);
     const y = parseInt(args._[4], 10);
     const x = parseInt(args._[5], 10);
     if (!pid) return;
@@ -3293,7 +3320,7 @@ function main() {
     const dir = (args._[1] || '').toLowerCase();
     const pid = args._[2];
     const sess = args._[3];
-    const title = args._[4];
+    const title = sanitizeTitle(args._[4]);
     const inMode = args._[5] === '1';
     const mouseAny = args._[6] === '1';
     if (!pid) return;
@@ -3361,5 +3388,7 @@ if (require.main === module) {
     statusKoreanLabel,
     renderTaskOverlaySummaryLines,
     renderNoTaskFallbackLines,
+    sanitizeTitle,
+    paneRoleOf,
   };
 }
