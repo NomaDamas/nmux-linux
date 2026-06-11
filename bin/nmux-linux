@@ -100,6 +100,24 @@ const NMUX_BIN_DIR = __resolveSelfDir();
 const NMUX_BIN = path.join(NMUX_BIN_DIR, 'nmux-linux');
 const SIDEBAR_HELPER = path.join(NMUX_BIN_DIR, 'nmux-linux-sidebar');
 
+// Absolute path to the node interpreter. tmux runs `run-shell`,
+// `display-popup -E`, `command-prompt`→run-shell and `set-hook`
+// commands through /bin/sh with a MINIMAL PATH (/usr/local/bin:
+// /usr/bin:/bin:/snap/bin …) that does NOT include the directory
+// holding our `node` — node installed under ~/.local/bin, nvm,
+// fnm, volta, asdf etc. all live outside it. Our binaries start
+// with `#!/usr/bin/env node`, so the kernel runs `env node`, env
+// scans that PATH, can't find node, and exits 127. tmux then
+// surfaces it as "'…/nmux-linux mouseup … ' returned 127" on every
+// click / wheel event (issues #9, #11) and silently breaks the
+// fix-layout / clear-status hooks and the new-project popup's
+// `exec` (issue #10). Invoking node by absolute path makes every
+// binding independent of run-shell's PATH. Bindings are rewritten
+// on each init/refresh, so a moved interpreter self-heals.
+const NODE_BIN = process.execPath;
+// `node <script>` invocation prefix for tmux command strings.
+const NMUX_RUN = `${NODE_BIN} ${NMUX_BIN}`;
+
 // Atomic JSON / text writes. Writes a sibling tmp then renames into place.
 function writeAtomic(filePath, content) {
   const dir = path.dirname(filePath);
@@ -346,14 +364,24 @@ function installBindings(session) {
     // if-shell with double quotes inside its branch strings can't
     // be parsed by tmux (treated as "too many arguments"), so we
     // do the routing in JS.
-    `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_BIN} mouseup #{pane_id} #{session_name} #{pane_title} #{mouse_y} #{mouse_x}'`,
+    //
+    // Only the pane-id (#{pane_id}, always a safe `%<n>` token) and
+    // numeric mouse coords ride the command line. session_name and
+    // pane_title are resolved from the pane-id INSIDE node (see the
+    // `mouseup` handler) — passing #{pane_title} verbatim let a pane
+    // title carrying spaces, a single quote, or leaked Kitty-graphics
+    // (APC) bytes word-split the arguments or break the binding's
+    // shell parsing entirely (issue #11).
+    `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_RUN} mouseup #{pane_id} #{mouse_y} #{mouse_x}'`,
 
     // Wheel routing: a tiny node helper does the 3-way dispatch
     // (sidebar swallow / right-top → daemon / else → copy-mode).
     // Nested tmux if-shell quoting was unmanageable across two
     // levels, so we move the routing out of the tmux config.
-    `bind-key -T root WheelUpPane run-shell -b '${NMUX_BIN} wheel up #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
-    `bind-key -T root WheelDownPane run-shell -b '${NMUX_BIN} wheel down #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
+    // session_name / pane_title are fetched from the pane-id in the
+    // handler for the same reason as mouseup (issue #11).
+    `bind-key -T root WheelUpPane run-shell -b '${NMUX_RUN} wheel up #{pane_id} #{pane_in_mode} #{mouse_any_flag}'`,
+    `bind-key -T root WheelDownPane run-shell -b '${NMUX_RUN} wheel down #{pane_id} #{pane_in_mode} #{mouse_any_flag}'`,
 
     // Double-click on a non-sidebar nmux-linux pane fires only the URL
     // launcher (background): capture pane wrap-joined, find the URL on
@@ -366,11 +394,11 @@ function installBindings(session) {
     // following clicks until cancelled. Word-copy via double-click is
     // sacrificed; drag-select still works through the wlcopy --join
     // helper for any text-grab need.
-    `bind-key -T root DoubleClick1Pane select-pane -t= \\; if-shell -F "#{&&:#{==:#{session_name},${session}},#{!=:#{pane_title},nmux-linux-sidebar}}" "run-shell -b '${NMUX_BIN} click-url #{pane_id} #{mouse_y}'" ""`,
+    `bind-key -T root DoubleClick1Pane select-pane -t= \\; if-shell -F "#{&&:#{==:#{session_name},${session}},#{!=:#{pane_title},nmux-linux-sidebar}}" "run-shell -b '${NMUX_RUN} click-url #{pane_id} #{mouse_y}'" ""`,
 
     // Prefix
-    `bind-key -T prefix C run-shell "${NMUX_BIN} prompt"`,
-    `bind-key -T prefix X run-shell "${NMUX_BIN} close-current"`,
+    `bind-key -T prefix C run-shell "${NMUX_RUN} prompt"`,
+    `bind-key -T prefix X run-shell "${NMUX_RUN} close-current"`,
 
     // Bell-driven notify intentionally disabled: a stray bell from any
     // process inside a project window would flip status to done + push a
@@ -385,17 +413,17 @@ function installBindings(session) {
     // produces an unbounded hook-storm. Manual border drags are caught
     // by the sidebar process's own width self-correction in
     // bin/nmux-linux-sidebar (selfCorrectWidth) instead.
-    `set-hook -g client-attached "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g client-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g window-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g client-attached "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g client-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g window-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
     // Avoid after-split-window for fix-layout: layout repair itself uses
     // split-window, so this hook can recurse and create duplicate status panes.
     // Unset the old global hook installed by earlier nmux-linux versions.
     `set-hook -gu after-split-window`,
 
     // Visiting a window clears its bell/done indicator (the ✓ in the sidebar).
-    `set-hook -g after-select-window "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
-    `set-hook -g session-window-changed "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
+    `set-hook -g after-select-window "run-shell -b '${NMUX_RUN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
+    `set-hook -g session-window-changed "run-shell -b '${NMUX_RUN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
   ];
   applyTmuxLines(lines);
   scrubWindowStatus(session);
@@ -457,7 +485,7 @@ function buildLayout(cfg, target, project, cwd, shell) {
   // Split LEFT for sidebar (fixed cells).
   tmux(['split-window', '-t', target, '-b', '-h', '-l', String(plan.sidebarWidth),
         '-c', cwd,
-        `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
+        `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${NODE_BIN} ${SIDEBAR_HELPER}`)}`], { allowFail: true });
   tmux(['select-pane', '-t', target, '-T', 'nmux-linux-sidebar'], { allowFail: true });
 
   // Back to main.
@@ -484,7 +512,7 @@ function buildLayout(cfg, target, project, cwd, shell) {
   // Step 2: from main, split → status pane (status column ends up
   // between main and sub on wide, or at the far right on 16:9).
   tmux(['split-window', '-t', target, '-h', '-l', String(plan.rightWidth), '-c', cwd,
-        `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+        `bash -lc ${shEsc(`exec ${NODE_BIN} ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
     { allowFail: true });
   tmux(['select-pane', '-t', target, '-T', TITLE_STATUS], { allowFail: true });
 
@@ -546,7 +574,7 @@ function relayoutCurrent() {
     const plan = computeResponsiveLayout(ww, wh, cfg.sidebarWidth || SIDEBAR_WIDTH, { hasRight: true });
     tmux(['split-window', '-t', main.pid, '-b', '-h', '-l', String(plan.sidebarWidth),
           '-c', cwd,
-          `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
+          `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${cfg.session} exec ${NODE_BIN} ${SIDEBAR_HELPER}`)}`], { allowFail: true });
     tmux(['select-pane', '-t', target, '-T', 'nmux-linux-sidebar'], { allowFail: true });
     tmux(['select-pane', '-t', main.pid], { allowFail: true });
   } else {
@@ -576,7 +604,7 @@ function relayoutCurrent() {
     tmux(['select-pane', '-t', main.pid], { allowFail: true });
   }
   tmux(['split-window', '-t', main.pid, '-h', '-l', String(planR.rightWidth), '-c', cwd,
-    `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+    `bash -lc ${shEsc(`exec ${NODE_BIN} ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
     { allowFail: true });
   tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'status')],
     { allowFail: true });
@@ -1067,7 +1095,7 @@ function ensureTaskOverlay(cfg, info) {
   if (status) {
     if (!paneRunsTaskOverlay(status.ppid)) {
       tmux(['respawn-pane', '-k', '-t', status.pid, '-c', cwd,
-        `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+        `bash -lc ${shEsc(`exec ${NODE_BIN} ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
         { allowFail: true });
       tmux(['select-pane', '-t', status.pid, '-T', paneTitleFor(info.proj, 'status')],
         { allowFail: true });
@@ -1084,7 +1112,7 @@ function ensureTaskOverlay(cfg, info) {
   });
   const newPaneId = tmux(['split-window', '-t', main.pid, '-h', '-l', String(plan.rightWidth || 1), '-c', cwd,
     '-P', '-F', '#{pane_id}',
-    `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+    `bash -lc ${shEsc(`exec ${NODE_BIN} ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
     { allowFail: true }).trim();
   if (newPaneId) {
     tmux(['select-pane', '-t', newPaneId, '-T', paneTitleFor(info.proj, 'status')],
@@ -1162,7 +1190,7 @@ function refreshOverlays() {
     const project = (cfg.projects || []).find(p => p.name === proj);
     const cwd = (project && project.cwd) || paneCwd || HOME;
     tmux(['respawn-pane', '-k', '-t', pid, '-c', cwd,
-      `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`], { allowFail: true });
+      `bash -lc ${shEsc(`exec ${NODE_BIN} ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`], { allowFail: true });
     tmux(['select-pane', '-t', pid, '-T', paneTitleFor(proj || '', 'status')], { allowFail: true });
     topCount++;
   }
@@ -1244,7 +1272,7 @@ function resizeCols() {
     // main and sub (on wide) or at the far right (on 16:9). Width
     // approximated; we re-resize at the end.
     tmux(['split-window', '-t', main.pid, '-h', '-l', String(rightW), '-c', cwd,
-      `bash -lc ${shEsc(`exec ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
+      `bash -lc ${shEsc(`exec ${NODE_BIN} ${NMUX_BIN} task-overlay --cwd ${shQuote(cwd)}`)}`],
       { allowFail: true });
     tmux(['select-pane', '-t', target, '-T', paneTitleFor(projName, 'status')],
       { allowFail: true });
@@ -1319,7 +1347,7 @@ function refreshSidebars() {
     if (!match) continue;
     hits++;
     tmux(['respawn-pane', '-k', '-t', pid,
-          `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${SESSION} exec ${SIDEBAR_HELPER}`)}`], { allowFail: true });
+          `bash -lc ${shEsc(`NMUX_LINUX_SESSION=${SESSION} exec ${NODE_BIN} ${SIDEBAR_HELPER}`)}`], { allowFail: true });
     tmux(['select-pane', '-t', pid, '-T', 'nmux-linux-sidebar'], { allowFail: true });
   }
   console.log(`refreshed ${hits} sidebar pane(s)`);
@@ -1351,28 +1379,50 @@ function isSidebarPid(pid) {
 // We instead use display-popup -E to spawn an interactive shell where
 // `read -r` captures the line as a literal bash string, and exec our
 // binary with the value already-properly-quoted by bash.
-function promptCommand() {
+function promptCommand(anchorPane) {
   // POSIX-sh compatible read (display-popup -E uses /bin/sh, and dash on
   // Debian/Ubuntu does NOT support `read -p`). Use printf + read -r.
+  //
+  // `exec` runs through display-popup's /bin/sh, whose PATH does NOT
+  // include node's dir, so `exec nmux-linux …` (env-node shebang) would
+  // 127 the moment the user pressed Enter (issue #10). Invoke node by
+  // absolute path, matching the mouse-binding fix.
   const cmd =
-    `printf 'project (name|path): '; ` +
+    `clear 2>/dev/null; ` +
+    `printf 'New project — enter name or path:\\n> '; ` +
     `IFS= read -r __nmux_input || exit 0; ` +
     `[ -n "$__nmux_input" ] || exit 0; ` +
-    `exec ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
-  // tmux ≥ 3.2 has display-popup. Try it first.
-  const popup = spawnSync('tmux', ['display-popup', '-E', cmd], { stdio: 'ignore' });
+    `exec ${shQuote(NODE_BIN)} ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
+  // tmux ≥ 3.2 has display-popup. Pin an explicit, modest geometry with a
+  // titled border so the input dialog renders consistently regardless of
+  // the clicked pane's width or the terminal size — a bare `display-popup`
+  // inherited a size that mis-rendered the prompt in small panes/terminals
+  // (issue #10). tmux clamps the popup to the client, so percentages stay
+  // safe on narrow terminals.
+  //
+  // `-t <anchorPane>`: when reached from a sidebar CLICK the chain runs
+  // under `run-shell -b` (backgrounded), where tmux may have no "current
+  // client" — a bare display-popup then aborts with "no current client"
+  // and nothing appears. Anchoring to the clicked pane lets tmux resolve
+  // the owning client (and the % size base) deterministically. The prefix
+  // keybinding path passes no pane: it already runs in a live client
+  // context, so the current-client default is correct there.
+  const popupArgs = ['display-popup', '-E'];
+  if (anchorPane) popupArgs.push('-t', String(anchorPane));
+  popupArgs.push('-w', '60%', '-h', '7', '-T', ' nmux-linux: new project ', cmd);
+  const popup = spawnSync('tmux', popupArgs, { stdio: 'ignore' });
   if (popup.status === 0) return;
   // Fallback for old tmux without display-popup. Single-command template
   // (no chained `;`) so a quote in user input fails parsing inside tmux
   // rather than escaping into shell.
   spawnSync('tmux', ['command-prompt', '-1', '-p', 'project (name|path):',
-                     `run-shell ${shQuote(`${NMUX_BIN} open '%%'`)}`], { stdio: 'ignore' });
+                     `run-shell ${shQuote(`${NMUX_RUN} open '%%'`)}`], { stdio: 'ignore' });
 }
 
 function confirmKill() {
   // tmux confirm-before runs the command on 'y' confirmation.
   spawnSync('tmux', ['confirm-before', '-p', 'kill nmux-linux session? (y/n) ',
-    `run-shell ${shQuote(`${NMUX_BIN} kill`)}`], { stdio: 'ignore' });
+    `run-shell ${shQuote(`${NMUX_RUN} kill`)}`], { stdio: 'ignore' });
 }
 
 function clickmapPathFor(paneId) {
@@ -1465,7 +1515,7 @@ function clickHandler(rowStr, colStr, paneId) {
         catch (e) { logClick(`reopen-error arg=${best.arg} err=${(e.message || e).slice(0, 200)}`); console.error(e.message); }
         break;
       case 'add':
-        promptCommand();
+        promptCommand(paneId);
         break;
       case 'kill':
         confirmKill();
@@ -2673,7 +2723,10 @@ function watcherIsAlive() {
 function startWatcherDaemonIfNeeded() {
   if (watcherIsAlive()) return;
   try { fs.unlinkSync(WATCHER_PID_FILE); } catch {}
-  const child = spawn(NMUX_BIN, ['watch-agents'],
+  // Spawn via the node interpreter (not the bare script) so the daemon
+  // launches even when the caller's PATH lacks node's dir — same root
+  // cause as the 127 mouse-binding failures.
+  const child = spawn(NODE_BIN, [NMUX_BIN, 'watch-agents'],
     { detached: true, stdio: 'ignore' });
   child.unref();
 }
@@ -2925,6 +2978,19 @@ function sanitizeTitle(title) {
   // Bare kitty-graphics APC payload that leaked into the title verbatim.
   if (/^G[A-Za-z]=[^;]*;/.test(s)) return '';
   return s;
+}
+// Resolve a pane's session + raw title from its pane-id. The mouse/wheel
+// bindings pass only the pane-id (a safe `%<n>` token) and look these up
+// here, so volatile, content-controlled values (a pane title can contain
+// arbitrary bytes) never travel on a tmux binding's command line where they
+// could word-split the arguments or break shell parsing (issue #11).
+function paneMeta(pid) {
+  const out = tmux(['display-message', '-p', '-t', String(pid),
+    '#{session_name}\t#{pane_title}'], { allowFail: true });
+  const line = (out.split('\n')[0] || '');
+  const tab = line.indexOf('\t');
+  if (tab < 0) return { session: line, title: '' };
+  return { session: line.slice(0, tab), title: line.slice(tab + 1) };
 }
 function paneRoleOf(title) {
   if (!title) return null;
@@ -3285,17 +3351,22 @@ function main() {
     return;
   }
   if (cmd === 'mouseup') {
-    // Args: <pane_id> <session> <pane_title> <mouse_y> <mouse_x>
+    // Args: <pane_id> <mouse_y> <mouse_x>
+    // session_name + pane_title are resolved from the pane-id here rather
+    // than passed on the command line: a pane title can hold arbitrary
+    // bytes (spaces, quotes, leaked Kitty-graphics payload) that would
+    // word-split or break the tmux binding (issue #11).
     // Dispatches the click:
     //   sidebar  → project click
     //   status   → task-overlay row click → jump main pane
     //   else      → just select the pane
     const pid = args._[1];
-    const sess = args._[2];
-    const title = sanitizeTitle(args._[3]);
-    const y = parseInt(args._[4], 10);
-    const x = parseInt(args._[5], 10);
+    const y = parseInt(args._[2], 10);
+    const x = parseInt(args._[3], 10);
     if (!pid) return;
+    const meta = paneMeta(pid);
+    const sess = meta.session;
+    const title = sanitizeTitle(meta.title);
     if (sess === SESSION) {
       const role = paneRoleOf(title);
       if (role === 'sidebar') {
@@ -3312,18 +3383,23 @@ function main() {
     return;
   }
   if (cmd === 'wheel') {
-    // Args: <up|down> <pane_id> <session> <pane_title> <pane_in_mode> <mouse_any_flag>
+    // Args: <up|down> <pane_id> <pane_in_mode> <mouse_any_flag>
+    // session_name + pane_title are resolved from the pane-id here, not
+    // passed as arguments — the wheel-up binding used to forward
+    // #{pane_title} verbatim, so a title polluted with a Kitty-graphics
+    // (APC base64) payload arrived as a long garbage argument (issue #11).
     // Dispatches the wheel event:
     //   sidebar  → swallow
     //   right-top → forward to task-overlay event queue
     //   else      → re-issue tmux's stock wheel behaviour
     const dir = (args._[1] || '').toLowerCase();
     const pid = args._[2];
-    const sess = args._[3];
-    const title = sanitizeTitle(args._[4]);
-    const inMode = args._[5] === '1';
-    const mouseAny = args._[6] === '1';
+    const inMode = args._[3] === '1';
+    const mouseAny = args._[4] === '1';
     if (!pid) return;
+    const meta = paneMeta(pid);
+    const sess = meta.session;
+    const title = sanitizeTitle(meta.title);
     if (sess === SESSION) {
       const role = paneRoleOf(title);
       if (role === 'sidebar') return; // swallow
