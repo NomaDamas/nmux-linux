@@ -99,6 +99,15 @@ function __resolveSelfDir() {
 const NMUX_BIN_DIR = __resolveSelfDir();
 const NMUX_BIN = path.join(NMUX_BIN_DIR, 'nmux-linux');
 const SIDEBAR_HELPER = path.join(NMUX_BIN_DIR, 'nmux-linux-sidebar');
+// Launcher for tmux run-shell / hook bindings. run-shell executes via
+// `/bin/sh -c` using the tmux server's environment, which frequently lacks
+// `node` on PATH (nvm/fnm/volta keep it in a shell-rc-only path). The script's
+// `#!/usr/bin/env node` shebang then fails to resolve the interpreter and the
+// shell reports exit 127 ("command not found"). Invoking the current node
+// binary explicitly (process.execPath is absolute) makes these bindings
+// independent of the PATH seen by tmux.
+const NODE_BIN = process.execPath;
+const NMUX_RUN = `${NODE_BIN} ${NMUX_BIN}`;
 
 // Atomic JSON / text writes. Writes a sibling tmp then renames into place.
 function writeAtomic(filePath, content) {
@@ -346,14 +355,14 @@ function installBindings(session) {
     // if-shell with double quotes inside its branch strings can't
     // be parsed by tmux (treated as "too many arguments"), so we
     // do the routing in JS.
-    `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_BIN} mouseup #{pane_id} #{session_name} #{pane_title} #{mouse_y} #{mouse_x}'`,
+    `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_RUN} mouseup #{pane_id} #{session_name} #{pane_title} #{mouse_y} #{mouse_x}'`,
 
     // Wheel routing: a tiny node helper does the 3-way dispatch
     // (sidebar swallow / right-top → daemon / else → copy-mode).
     // Nested tmux if-shell quoting was unmanageable across two
     // levels, so we move the routing out of the tmux config.
-    `bind-key -T root WheelUpPane run-shell -b '${NMUX_BIN} wheel up #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
-    `bind-key -T root WheelDownPane run-shell -b '${NMUX_BIN} wheel down #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
+    `bind-key -T root WheelUpPane run-shell -b '${NMUX_RUN} wheel up #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
+    `bind-key -T root WheelDownPane run-shell -b '${NMUX_RUN} wheel down #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
 
     // Double-click on a non-sidebar nmux-linux pane fires only the URL
     // launcher (background): capture pane wrap-joined, find the URL on
@@ -366,11 +375,11 @@ function installBindings(session) {
     // following clicks until cancelled. Word-copy via double-click is
     // sacrificed; drag-select still works through the wlcopy --join
     // helper for any text-grab need.
-    `bind-key -T root DoubleClick1Pane select-pane -t= \\; if-shell -F "#{&&:#{==:#{session_name},${session}},#{!=:#{pane_title},nmux-linux-sidebar}}" "run-shell -b '${NMUX_BIN} click-url #{pane_id} #{mouse_y}'" ""`,
+    `bind-key -T root DoubleClick1Pane select-pane -t= \\; if-shell -F "#{&&:#{==:#{session_name},${session}},#{!=:#{pane_title},nmux-linux-sidebar}}" "run-shell -b '${NMUX_RUN} click-url #{pane_id} #{mouse_y}'" ""`,
 
     // Prefix
-    `bind-key -T prefix C run-shell "${NMUX_BIN} prompt"`,
-    `bind-key -T prefix X run-shell "${NMUX_BIN} close-current"`,
+    `bind-key -T prefix C run-shell "${NMUX_RUN} prompt"`,
+    `bind-key -T prefix X run-shell "${NMUX_RUN} close-current"`,
 
     // Bell-driven notify intentionally disabled: a stray bell from any
     // process inside a project window would flip status to done + push a
@@ -385,17 +394,17 @@ function installBindings(session) {
     // produces an unbounded hook-storm. Manual border drags are caught
     // by the sidebar process's own width self-correction in
     // bin/nmux-linux-sidebar (selfCorrectWidth) instead.
-    `set-hook -g client-attached "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g client-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
-    `set-hook -g window-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_BIN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g client-attached "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g client-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
+    `set-hook -g window-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
     // Avoid after-split-window for fix-layout: layout repair itself uses
     // split-window, so this hook can recurse and create duplicate status panes.
     // Unset the old global hook installed by earlier nmux-linux versions.
     `set-hook -gu after-split-window`,
 
     // Visiting a window clears its bell/done indicator (the ✓ in the sidebar).
-    `set-hook -g after-select-window "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
-    `set-hook -g session-window-changed "run-shell -b '${NMUX_BIN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
+    `set-hook -g after-select-window "run-shell -b '${NMUX_RUN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
+    `set-hook -g session-window-changed "run-shell -b '${NMUX_RUN} clear-status --project \\"#{@nmuxlinux_project}\\" >/dev/null 2>&1 || true'"`,
   ];
   applyTmuxLines(lines);
   scrubWindowStatus(session);
@@ -1358,7 +1367,7 @@ function promptCommand() {
     `printf 'project (name|path): '; ` +
     `IFS= read -r __nmux_input || exit 0; ` +
     `[ -n "$__nmux_input" ] || exit 0; ` +
-    `exec ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
+    `exec ${shQuote(NODE_BIN)} ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
   // tmux ≥ 3.2 has display-popup. Try it first.
   const popup = spawnSync('tmux', ['display-popup', '-E', cmd], { stdio: 'ignore' });
   if (popup.status === 0) return;
@@ -1366,13 +1375,13 @@ function promptCommand() {
   // (no chained `;`) so a quote in user input fails parsing inside tmux
   // rather than escaping into shell.
   spawnSync('tmux', ['command-prompt', '-1', '-p', 'project (name|path):',
-                     `run-shell ${shQuote(`${NMUX_BIN} open '%%'`)}`], { stdio: 'ignore' });
+                     `run-shell ${shQuote(`${NMUX_RUN} open '%%'`)}`], { stdio: 'ignore' });
 }
 
 function confirmKill() {
   // tmux confirm-before runs the command on 'y' confirmation.
   spawnSync('tmux', ['confirm-before', '-p', 'kill nmux-linux session? (y/n) ',
-    `run-shell ${shQuote(`${NMUX_BIN} kill`)}`], { stdio: 'ignore' });
+    `run-shell ${shQuote(`${NMUX_RUN} kill`)}`], { stdio: 'ignore' });
 }
 
 function clickmapPathFor(paneId) {
