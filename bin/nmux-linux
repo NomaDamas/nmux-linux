@@ -1359,8 +1359,15 @@ function promptCommand() {
     `IFS= read -r __nmux_input || exit 0; ` +
     `[ -n "$__nmux_input" ] || exit 0; ` +
     `exec ${shQuote(NMUX_BIN)} open "$__nmux_input"`;
-  // tmux ≥ 3.2 has display-popup. Try it first.
-  const popup = spawnSync('tmux', ['display-popup', '-E', cmd], { stdio: 'ignore' });
+  // tmux ≥ 3.2 has display-popup. Try it first. Explicit geometry is
+  // required: without -w/-h tmux derives the popup size from the cursor
+  // position in the active pane, so a small pane (e.g. the sidebar) or an
+  // unusual terminal size yields a clipped, broken-looking input box. A
+  // fixed size that tmux auto-clamps to the client renders consistently
+  // regardless of pane/terminal dimensions.
+  const popup = spawnSync('tmux',
+    ['display-popup', '-E', '-w', '60', '-h', '7',
+     '-T', ' new project ', cmd], { stdio: 'ignore' });
   if (popup.status === 0) return;
   // Fallback for old tmux without display-popup. Single-command template
   // (no chained `;`) so a quote in user input fails parsing inside tmux
