@@ -345,15 +345,19 @@ function installBindings(session) {
     // 3-way click routing dispatched via node — nested tmux
     // if-shell with double quotes inside its branch strings can't
     // be parsed by tmux (treated as "too many arguments"), so we
-    // do the routing in JS.
-    `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_BIN} mouseup #{pane_id} #{session_name} #{pane_title} #{mouse_y} #{mouse_x}'`,
+    // do the routing in JS. #{pane_title} is NOT passed through the
+    // shell: an app can set its title to arbitrary bytes (OSC 0/2),
+    // and a quote/`;` in the title would break the single-quoted
+    // run-shell string and execute the garbage as a command. The
+    // title is resolved safely inside node from the trusted pane id.
+    `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_BIN} mouseup #{pane_id} #{session_name} #{mouse_y} #{mouse_x}'`,
 
     // Wheel routing: a tiny node helper does the 3-way dispatch
     // (sidebar swallow / right-top → daemon / else → copy-mode).
     // Nested tmux if-shell quoting was unmanageable across two
     // levels, so we move the routing out of the tmux config.
-    `bind-key -T root WheelUpPane run-shell -b '${NMUX_BIN} wheel up #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
-    `bind-key -T root WheelDownPane run-shell -b '${NMUX_BIN} wheel down #{pane_id} #{session_name} #{pane_title} #{pane_in_mode} #{mouse_any_flag}'`,
+    `bind-key -T root WheelUpPane run-shell -b '${NMUX_BIN} wheel up #{pane_id} #{session_name} #{pane_in_mode} #{mouse_any_flag}'`,
+    `bind-key -T root WheelDownPane run-shell -b '${NMUX_BIN} wheel down #{pane_id} #{session_name} #{pane_in_mode} #{mouse_any_flag}'`,
 
     // Double-click on a non-sidebar nmux-linux pane fires only the URL
     // launcher (background): capture pane wrap-joined, find the URL on
@@ -2926,6 +2930,19 @@ function sanitizeTitle(title) {
   if (/^G[A-Za-z]=[^;]*;/.test(s)) return '';
   return s;
 }
+
+// Resolve a pane's title from its (trusted) pane id, sanitized. Mouse/wheel
+// bindings pass only #{pane_id} through the shell — never #{pane_title} —
+// because an app-controlled title can contain quotes/control bytes that
+// would break the run-shell quoting. display-message captures the raw
+// title as a single spawnSync arg (no shell), so it stays inert here.
+function paneTitleOf(pid) {
+  if (!pid) return '';
+  const r = spawnSync('tmux', ['display-message', '-p', '-t', pid, '#{pane_title}'],
+    { encoding: 'utf8' });
+  if (r.status !== 0) return '';
+  return sanitizeTitle((r.stdout || '').replace(/\n$/, ''));
+}
 function paneRoleOf(title) {
   if (!title) return null;
   if (title === 'nmux-linux-sidebar') return 'sidebar';
@@ -3285,16 +3302,16 @@ function main() {
     return;
   }
   if (cmd === 'mouseup') {
-    // Args: <pane_id> <session> <pane_title> <mouse_y> <mouse_x>
+    // Args: <pane_id> <session> <mouse_y> <mouse_x>
     // Dispatches the click:
     //   sidebar  → project click
     //   status   → task-overlay row click → jump main pane
     //   else      → just select the pane
     const pid = args._[1];
     const sess = args._[2];
-    const title = sanitizeTitle(args._[3]);
-    const y = parseInt(args._[4], 10);
-    const x = parseInt(args._[5], 10);
+    const y = parseInt(args._[3], 10);
+    const x = parseInt(args._[4], 10);
+    const title = paneTitleOf(pid);
     if (!pid) return;
     if (sess === SESSION) {
       const role = paneRoleOf(title);
@@ -3312,7 +3329,7 @@ function main() {
     return;
   }
   if (cmd === 'wheel') {
-    // Args: <up|down> <pane_id> <session> <pane_title> <pane_in_mode> <mouse_any_flag>
+    // Args: <up|down> <pane_id> <session> <pane_in_mode> <mouse_any_flag>
     // Dispatches the wheel event:
     //   sidebar  → swallow
     //   right-top → forward to task-overlay event queue
@@ -3320,9 +3337,9 @@ function main() {
     const dir = (args._[1] || '').toLowerCase();
     const pid = args._[2];
     const sess = args._[3];
-    const title = sanitizeTitle(args._[4]);
-    const inMode = args._[5] === '1';
-    const mouseAny = args._[6] === '1';
+    const inMode = args._[4] === '1';
+    const mouseAny = args._[5] === '1';
+    const title = paneTitleOf(pid);
     if (!pid) return;
     if (sess === SESSION) {
       const role = paneRoleOf(title);
