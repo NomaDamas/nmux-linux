@@ -59,3 +59,17 @@ test('the new-project popup execs node by absolute path (#10)', () => {
     /exec \$\{shQuote\(NODE_BIN\)\} \$\{shQuote\(NMUX_BIN\)\} open/,
     'new-project popup must exec node by absolute path');
 });
+
+test('finishing a manual border drag re-pins the fixed panes via fix-layout (#13)', () => {
+  // Sidebar / right (progress) / sub widths are fixed; only main is meant to
+  // be user-resizable. A border-drag-end must converge the layout so the
+  // auxiliary text areas do not stay shifted after a drag. MouseDragEnd1Border
+  // is a one-shot user gesture (fix-layout's own resize-pane never emits it),
+  // so it cannot recurse into a hook-storm the way after-resize-pane would.
+  const drag = SRC.match(/bind-key -T root MouseDragEnd1Border[^\n]*/);
+  assert.ok(drag, 'a MouseDragEnd1Border binding must exist');
+  assert.ok(drag[0].includes('${NMUX_RUN}') && drag[0].includes('fix-layout'),
+    `border-drag binding must run fix-layout via NMUX_RUN: ${drag[0]}`);
+  assert.doesNotMatch(SRC, /set-hook -g after-resize-pane/,
+    'after-resize-pane must not be hooked (it storms from fix-layout resizes)');
+});
