@@ -80,6 +80,47 @@ test('buildSidebarFrame hard-clips every visual line on very narrow sidebars', (
   assert.match(out.clickmap, /^3\tswitch\t2\t0/m);
 });
 
+// issue #14: a click in the lower sidebar must activate the row under the
+// cursor. The clickmap stores logical row numbers and tmux reports a click's
+// *visual* row, so they only stay 1:1 while every rendered line fits the pane
+// width. Project names with wide (CJK / emoji) glyphs used to under-count and
+// soft-wrap, pushing every clickmap row below the wrap up by one.
+test('buildSidebarFrame keeps wide-character rows from wrapping (issue #14)', () => {
+  const width = 26;
+  // Display width: wide glyphs (CJK / emoji) count as two terminal cells.
+  const dispWidth = (s) => {
+    let n = 0;
+    for (const ch of stripAnsi(s)) {
+      const cp = ch.codePointAt(0);
+      const wide = (cp >= 0x1100 && cp <= 0x115f) ||
+        (cp >= 0x2e80 && cp <= 0xa4cf) ||
+        (cp >= 0xac00 && cp <= 0xd7a3) ||
+        (cp >= 0xf900 && cp <= 0xfaff) ||
+        (cp >= 0xff00 && cp <= 0xff60) ||
+        (cp >= 0x1f300 && cp <= 0x1faff);
+      n += wide ? 2 : 1;
+    }
+    return n;
+  };
+  const out = sidebar.buildSidebarFrame({
+    rows: [
+      { i: '1', n: '日本語プロジェクト', a: true, s: 'idle', p: '日本語プロジェクト', m: '' },
+      { i: '2', n: 'proj-b', a: false, s: 'idle', p: 'proj-b', m: '' },
+    ],
+    registry: [],
+    discover: [],
+    width,
+  });
+
+  for (const line of out.body.split('\n')) {
+    assert.ok(dispWidth(line) <= width - 1,
+      `line must not wrap: ${JSON.stringify(stripAnsi(line))} (width ${dispWidth(line)})`);
+  }
+  // Both project rows stay where the clickmap says they are.
+  assert.match(out.clickmap, /^2\tswitch\t1\t0/m);
+  assert.match(out.clickmap, /^3\tswitch\t2\t0/m);
+});
+
 test('responsiveSidebarWidth follows small/medium/large breakpoints', () => {
   assert.equal(sidebar.responsiveSidebarWidth(60, 26), 16);
   assert.equal(sidebar.responsiveSidebarWidth(90, 26), 20);
