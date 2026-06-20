@@ -410,12 +410,18 @@ function installBindings(session) {
     // so the sidebar stretches when a wider client attaches. Pin it back.
     // We deliberately do NOT hook after-resize-pane / after-kill-pane:
     // those events fire FROM fix-layout's own resize-pane calls, which
-    // produces an unbounded hook-storm. Manual border drags are caught
-    // by the sidebar process's own width self-correction in
-    // bin/nmux-linux-sidebar (selfCorrectWidth) instead.
+    // produces an unbounded hook-storm.
     `set-hook -g client-attached "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
     `set-hook -g client-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
     `set-hook -g window-resized "run-shell -b 'NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true'"`,
+    // Manual border drag: the sidebar, right (progress) column and the
+    // wide-screen sub pane all have fixed widths — only main is meant to be
+    // user-resizable. When a drag ends, re-pin the fixed panes so dragging
+    // any border just trades cells with main and never leaves the auxiliary
+    // text areas shifted/shaking. MouseDragEnd1Border is a one-shot user
+    // gesture (not emitted by fix-layout's own resize-pane), so unlike
+    // after-resize-pane it cannot cause a hook-storm.
+    `bind-key -T root MouseDragEnd1Border run-shell -b "NMUX_LINUX_HOOK_SESSION=#{session_name} ${NMUX_RUN} fix-layout >/dev/null 2>&1 || true"`,
     // Avoid after-split-window for fix-layout: layout repair itself uses
     // split-window, so this hook can recurse and create duplicate status panes.
     // Unset the old global hook installed by earlier nmux-linux versions.
@@ -1059,6 +1065,7 @@ function fixLayout() {
   for (const [, info] of byWin) {
     rebuildMissingMain(cfg, info);
     ensureTaskOverlay(cfg, info);
+    ensureSubPane(cfg, info);
     convergeResponsiveWindowLayout(cfg, info);
   }
   if (hudSuppressionActive()) killOmxHudPanes();
@@ -1119,6 +1126,39 @@ function ensureTaskOverlay(cfg, info) {
       { allowFail: true });
     tmux(['select-pane', '-t', main.pid], { allowFail: true });
   }
+}
+
+// Wide monitors get a fixed-width auxiliary sub pane. buildLayout already
+// creates it when a window is first built wide; this re-adds it when an
+// existing window grows into wide-aspect territory (monitor swap, client
+// resize) so the user does not have to run resize-cols by hand. Idempotent:
+// bails when a sub already exists or the screen is not wide enough for one.
+// Never removes a sub — automatic resize must not kill panes; narrow screens
+// just collapse it to a sliver in computeResponsiveLayout. The new pane is
+// pushed into info.panes so the convergence pass that follows sizes every
+// column with hasSub accounted for.
+function ensureSubPane(cfg, info) {
+  if (!info || !info.panes.length || !info.proj) return;
+  if (info.panes.some(p => paneRoleOf(p.title) === 'webview')) return;
+  if (info.panes.some(p => paneRoleOf(p.title) === 'sub')) return;
+  const plan = computeResponsiveLayout(info.winW, info.winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
+    hasRight: true,
+    wantSub: isWideAspect(info.winW, info.winH),
+  });
+  if (!plan.canFullSub || plan.subWidth <= 0) return;
+  const main = info.panes.find(p => paneRoleOf(p.title) === 'main')
+    || info.panes.find(p => !p.isSidebar && !isReservedPaneTitle(p.title));
+  if (!main) return;
+  const project = (cfg.projects || []).find(p => p.name === info.proj);
+  const cwd = (project && project.cwd) || info.paneCwd || HOME;
+  const shell = process.env.SHELL || '/bin/bash';
+  const newPaneId = tmux(['split-window', '-t', main.pid, '-h', '-l', String(plan.subWidth),
+    '-c', cwd, '-P', '-F', '#{pane_id}', shell], { allowFail: true }).trim();
+  if (!newPaneId) return;
+  const title = paneTitleFor(info.proj, 'sub');
+  tmux(['select-pane', '-t', newPaneId, '-T', title], { allowFail: true });
+  tmux(['select-pane', '-t', main.pid], { allowFail: true });
+  info.panes.push({ pid: newPaneId, title, ppid: '', isSidebar: false, width: plan.subWidth, paneCwd: cwd, paneCmd: shell });
 }
 
 // If a window has a sidebar but no "main" project pane, the layout looks
