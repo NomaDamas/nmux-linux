@@ -86,17 +86,70 @@ function rowStyle(s, active) {
   return { open: '', close: '', loud: false };
 }
 function termWidth() { return process.stdout.columns || 26; }
-function visLen(s) { return s.replace(/\x1b\[[0-9;]*m/g, '').length; }
+const ANSI_RE = /^\x1b\[[0-9;]*m/;
+// Terminal display width of a single code point. A clickmap row maps a
+// logical line to an action, while tmux reports the click's *visual* row.
+// They only stay 1:1 while every rendered line fits within the pane width,
+// so width math here must count terminal cells — not UTF-16 code units.
+// East-Asian wide / fullwidth glyphs and most emoji occupy two cells;
+// combining marks and variation selectors occupy none. Measuring them with
+// String#length under-counts, the line soft-wraps, and every clickmap row
+// below the wrap shifts up by one (issue #14).
+function charWidth(cp) {
+  if (cp === 0x200b ||
+      (cp >= 0x0300 && cp <= 0x036f) ||   // combining diacritical marks
+      (cp >= 0x200c && cp <= 0x200f) ||   // zero-width joiners / marks
+      (cp >= 0xfe00 && cp <= 0xfe0f)) {   // variation selectors
+    return 0;
+  }
+  if (cp >= 0x1100 && (
+      cp <= 0x115f ||                       // Hangul Jamo
+      cp === 0x2329 || cp === 0x232a ||
+      (cp >= 0x2e80 && cp <= 0x303e) ||     // CJK radicals .. symbols
+      (cp >= 0x3041 && cp <= 0x33ff) ||     // Hiragana .. CJK compat
+      (cp >= 0x3400 && cp <= 0x4dbf) ||     // CJK Ext A
+      (cp >= 0x4e00 && cp <= 0x9fff) ||     // CJK Unified
+      (cp >= 0xa000 && cp <= 0xa4cf) ||     // Yi
+      (cp >= 0xac00 && cp <= 0xd7a3) ||     // Hangul Syllables
+      (cp >= 0xf900 && cp <= 0xfaff) ||     // CJK compat ideographs
+      (cp >= 0xfe10 && cp <= 0xfe19) ||     // vertical forms
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||     // CJK compat forms
+      (cp >= 0xff00 && cp <= 0xff60) ||     // Fullwidth forms
+      (cp >= 0xffe0 && cp <= 0xffe6) ||     // Fullwidth signs
+      (cp >= 0x1f300 && cp <= 0x1faff) ||   // emoji / pictographs
+      (cp >= 0x20000 && cp <= 0x3fffd))) {  // CJK Ext B+
+    return 2;
+  }
+  return 1;
+}
+function visLen(s) {
+  let width = 0;
+  for (let i = 0; i < s.length; ) {
+    if (s[i] === '\x1b') {
+      const m = s.slice(i).match(ANSI_RE);
+      if (m) { i += m[0].length; continue; }
+    }
+    const cp = s.codePointAt(i);
+    width += charWidth(cp);
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return width;
+}
 function pad(text, w) {
   const v = visLen(text);
   if (v > w) {
-    let cut = '', plain = '', i = 0;
-    while (i < text.length && plain.length < w - 1) {
+    let cut = '', width = 0, i = 0;
+    while (i < text.length) {
       if (text[i] === '\x1b') {
-        const m = text.slice(i).match(/^\x1b\[[0-9;]*m/);
+        const m = text.slice(i).match(ANSI_RE);
         if (m) { cut += m[0]; i += m[0].length; continue; }
       }
-      cut += text[i]; plain += text[i]; i++;
+      const cp = text.codePointAt(i);
+      const cw = charWidth(cp);
+      if (width + cw > w - 1) break;   // reserve one cell for the ellipsis
+      cut += String.fromCodePoint(cp);
+      width += cw;
+      i += cp > 0xffff ? 2 : 1;
     }
     return cut + '…\x1b[0m';
   }
