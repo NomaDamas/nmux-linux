@@ -1144,22 +1144,56 @@ function ensureTaskOverlay(cfg, info) {
 // just collapse it to a sliver in computeResponsiveLayout. The new pane is
 // pushed into info.panes so the convergence pass that follows sizes every
 // column with hasSub accounted for.
+// Rightmost pane id in a window (largest pane_left). Used to place the
+// auxiliary sub pane as a full-height column at the far right.
+function rightmostPaneId(winTarget) {
+  const out = tmux(['list-panes', '-t', winTarget, '-F', '#{pane_left}\t#{pane_id}'],
+    { allowFail: true });
+  let best = null;
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [leftStr, pid] = line.split('\t');
+    const left = parseInt(leftStr, 10);
+    if (!pid || !Number.isFinite(left)) continue;
+    if (!best || left > best.left) best = { left, pid };
+  }
+  return best ? best.pid : null;
+}
+
 function ensureSubPane(cfg, info) {
   if (!info || !info.panes.length || !info.proj) return;
   if (info.panes.some(p => paneRoleOf(p.title) === 'webview')) return;
-  if (info.panes.some(p => paneRoleOf(p.title) === 'sub')) return;
   const plan = computeResponsiveLayout(info.winW, info.winH, cfg.sidebarWidth || SIDEBAR_WIDTH, {
     hasRight: true,
+    hasSub: info.panes.some(p => paneRoleOf(p.title) === 'sub'),
     wantSub: isWideAspect(info.winW, info.winH),
   });
   if (!plan.canFullSub || plan.subWidth <= 0) return;
   const main = info.panes.find(p => paneRoleOf(p.title) === 'main')
     || info.panes.find(p => !p.isSidebar && !isReservedPaneTitle(p.title));
   if (!main) return;
+  const winTarget = `${cfg.session}:${info.idx}`;
+
+  // The sub pane must be a full-height column at the FAR RIGHT — not
+  // wedged between main and the status column. An existing sub that is
+  // not already the rightmost pane is relocated (kill + recreate); this
+  // is a one-shot per window since afterwards it is rightmost and the
+  // check below short-circuits.
+  const existingSub = info.panes.find(p => paneRoleOf(p.title) === 'sub');
+  if (existingSub) {
+    if (existingSub.pid === rightmostPaneId(winTarget)) return;  // already far right
+    tmux(['kill-pane', '-t', existingSub.pid], { allowFail: true });
+    info.panes = info.panes.filter(p => p.pid !== existingSub.pid);
+  }
+
   const project = (cfg.projects || []).find(p => p.name === info.proj);
   const cwd = (project && project.cwd) || info.paneCwd || HOME;
   const shell = process.env.SHELL || '/bin/bash';
-  const newPaneId = tmux(['split-window', '-t', main.pid, '-h', '-l', String(plan.subWidth),
+  // Split off the current rightmost pane with -f (full window height) so
+  // the new pane spans the whole height at the far-right edge regardless
+  // of the right column being vertically split into status + bash.
+  const rightmost = rightmostPaneId(winTarget) || main.pid;
+  const newPaneId = tmux(['split-window', '-t', rightmost, '-h', '-f', '-l', String(plan.subWidth),
     '-c', cwd, '-P', '-F', '#{pane_id}', shell], { allowFail: true }).trim();
   if (!newPaneId) return;
   const title = paneTitleFor(info.proj, 'sub');
@@ -2712,8 +2746,11 @@ function taskOverlayDaemon(cwd) {
         const marker = isLast ? (working ? '\x1b[1;33m▸\x1b[0m' : '\x1b[1;32m▸\x1b[0m') : ' ';
         const numCol = isLast ? '\x1b[1;38;5;39m' : '\x1b[2m';
         const bodyStyle = isLast ? '\x1b[1m' : '';
-        const row1 = lines.length + 1;
-        rowMap.set(row1, sub);
+        // rowMap keys are 0-based visual rows to match tmux #{mouse_y}
+        // (the click coordinate is 0-based; the sidebar clickmap uses the
+        // same convention). lines.length here is the 0-based index of the
+        // row about to be pushed.
+        rowMap.set(lines.length, sub);
         lines.push(`${marker}${numCol}${num}.\x1b[0m ${bodyStyle}${text}\x1b[0m`);
       }
       if (belowCount > 0) {
@@ -2782,8 +2819,8 @@ function taskOverlayDaemon(cwd) {
         const text = sub.slice(0, w - 6);
         const style = checked ? '\x1b[2m' : '';
         const close = style ? '\x1b[0m' : '';
-        const row1 = lines.length + 1;
-        rowMap.set(row1, sub);
+        // 0-based visual row to match tmux #{mouse_y} (see messages branch).
+        rowMap.set(lines.length, sub);
         lines.push(` ${icon} ${style}${text}${close}`);
       }
       if (belowCount > 0) {
