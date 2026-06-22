@@ -2565,8 +2565,8 @@ function taskOverlayDaemon(cwd) {
         const text = sub.slice(0, w - 6);
         const style = checked ? '\x1b[2m' : '';
         const close = style ? '\x1b[0m' : '';
-        const row1 = lines.length + 1;
-        rowMap.set(row1, sub);
+        const row0 = lines.length;
+        rowMap.set(row0, sub);
         lines.push(` ${icon} ${style}${text}${close}`);
       }
       if (belowCount > 0) {
