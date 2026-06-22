@@ -331,8 +331,10 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
   lines.push('\x1b[2m' + pad(' prefix C: new', lineW) + '\x1b[0m');
   lines.push('\x1b[2m' + pad(' prefix X: close', lineW) + '\x1b[0m');
 
+  const rendered = lines.map(line => pad(line, lineW) + '\x1b[K');
   return {
-    body: lines.map(line => pad(line, lineW) + '\x1b[K').join('\n') + '\n\x1b[J',
+    body: rendered.join('\n') + '\n\x1b[J',
+    lines: rendered,
     clickmap: map.join('\n') + '\n',
   };
 }
@@ -359,7 +361,7 @@ let __nextStateAt = 0;
 let __nextResizeCheckAt = 0;
 let __lastWidthSeen = 0;
 let __lastWidthChangeAt = 0;
-let __lastBody = null;
+let __lastLines = null;
 let __lastClickmap = null;
 let __firstPaint = true;
 let __rendering = false;
@@ -431,6 +433,29 @@ function terminalFrame(body) {
   return SYNC_BEGIN + clear + body + SYNC_END;
 }
 
+// Incremental repaint. A full clear+home rewrite of the whole pane on
+// every spinner tick (200ms) makes static chrome — the footer hints —
+// visibly flicker on terminals without synchronized-output support.
+// Instead diff against the previously painted lines and cursor-address
+// only the rows that actually changed (typically just the spinner row),
+// so unchanged lines are never touched. Falls back to a full repaint on
+// first paint or when the line count changes (structural shift).
+function diffFrame(newLines) {
+  if (__firstPaint || !__lastLines || __lastLines.length !== newLines.length) {
+    __firstPaint = false;
+    __lastLines = newLines;
+    return SYNC_BEGIN + '\x1b[2J\x1b[H' + newLines.join('\n') + SYNC_END;
+  }
+  let out = '';
+  for (let i = 0; i < newLines.length; i++) {
+    if (newLines[i] !== __lastLines[i]) {
+      out += `\x1b[${i + 1};1H` + newLines[i];
+    }
+  }
+  __lastLines = newLines;
+  return out ? SYNC_BEGIN + out + SYNC_END : '';
+}
+
 let __anyRunning = false;
 function render({ forceScan = false } = {}) {
   if (__rendering) { __renderAgain = true; return; }
@@ -443,7 +468,7 @@ function render({ forceScan = false } = {}) {
     const fmt = '#{window_index}\t#{window_name}\t#{window_active}\t#{@nmuxlinux_status}\t#{@nmuxlinux_project}\t#{@nmuxlinux_message}\t#{@nmuxlinux_status_at}';
     const rows = normalizeRows(parseRows(t(['list-windows', '-t', SESSION, '-F', fmt])), now);
     __anyRunning = rows.some(r => r.s === 'running');
-    const { body, clickmap } = buildSidebarFrame({
+    const { lines, clickmap } = buildSidebarFrame({
       rows,
       registry: __registryCache,
       discover: __discoverCache,
@@ -455,11 +480,8 @@ function render({ forceScan = false } = {}) {
       try { writeAtomic(CLICKMAP_PATH, clickmap); } catch {}
       __lastClickmap = clickmap;
     }
-    if (body !== __lastBody) {
-      process.stdout.write(terminalFrame(body));
-      __firstPaint = false;
-      __lastBody = body;
-    }
+    const frameOut = diffFrame(lines);
+    if (frameOut) process.stdout.write(frameOut);
     if (forceScan || now >= __nextStateAt) {
       persistOpen(rows);
       __nextStateAt = now + STATE_INTERVAL_MS;

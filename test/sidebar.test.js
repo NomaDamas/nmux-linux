@@ -46,6 +46,24 @@ test('buildSidebarFrame is deterministic and keeps clickmap stable across spinne
   assert.match(a.body, /\x1b\[K/, 'frame body should clear to end of line');
 });
 
+test('spinner-only repaint changes exactly one rendered line (no footer flicker)', () => {
+  const input = {
+    rows: [{ i: '1', n: 'proj-a', a: true, s: 'running', p: 'proj-a', m: '' }],
+    registry: [{ name: 'proj-a' }, { name: 'proj-b' }],
+    discover: [{ name: 'proj-c' }],
+    width: 26,
+  };
+  const a = sidebar.buildSidebarFrame({ ...input, frame: 0 });
+  const b = sidebar.buildSidebarFrame({ ...input, frame: 1 });
+  assert.equal(a.lines.length, b.lines.length, 'line count is structurally stable');
+  const changed = a.lines.filter((line, i) => line !== b.lines[i]);
+  assert.equal(changed.length, 1, 'only the spinner row differs between frames');
+  // The footer hint lines must be byte-identical so the incremental
+  // repaint never touches them (root cause of the flickering footer).
+  const footer = l => /click row=switch|close window|prefix/.test(l);
+  assert.deepEqual(a.lines.filter(footer), b.lines.filter(footer));
+});
+
 test('buildSidebarFrame constrains top chrome to one row in narrow sidebars', () => {
   const width = 16;
   const out = sidebar.buildSidebarFrame({

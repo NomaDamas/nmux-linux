@@ -541,6 +541,13 @@ function buildLayout(cfg, target, project, cwd, shell) {
 function isWideAspect(winW, winH) {
   if (!Number.isFinite(winW)) return false;
   if (winW >= 300) return true;
+  // Absolute-width trigger: on an ordinary wide monitor there can be lots
+  // of leftover horizontal space without the window being ultra-wide by
+  // aspect ratio. Once the window is this wide, prefer spending the slack
+  // on an extra far-right pane rather than over-stretching the main pane.
+  // computeResponsiveLayout still gates the sub pane on there being real
+  // room (minMain + SUB_MIN_WIDTH), so narrow/short clients stay 3-column.
+  if (winW >= 140) return true;
   if (!Number.isFinite(winH) || winH <= 0) return false;
   return (winW / winH) >= 4.0;
 }
@@ -1648,6 +1655,8 @@ function clickUrlAtPane(paneId, yStr) {
 const CLAUDE_PROJECTS_DIR = path.join(HOME, '.claude', 'projects');
 const OPENCODE_TASKS_DIR = path.join(HOME, '.config', 'opencode', 'tasks');
 const TASK_OVERLAY_TICK_MS = 2000;
+const GJC_SESSIONS_DIR = path.join(HOME, '.gjc', 'agent', 'sessions');
+const GJC_TERMINAL_DIR = path.join(HOME, '.gjc', 'agent', 'terminal-sessions');
 
 // Encode a cwd the way Claude Code names its project slugs: any `/`
 // or `.` becomes `-`. Anchor with a leading `-` so it matches the
@@ -2078,6 +2087,93 @@ function readTodoSource(cwd) {
   return null;
 }
 
+// --- gjc (gajae coding agent) source ---
+// gjc is the primary agent in this workspace. Unlike the task-list
+// sources above, the status pane for gjc surfaces the USER'S OWN typed
+// messages — the command history — so the operator can see at a glance
+// what they asked for, whether the last command is still running or
+// waiting, and click any of them to jump the main pane back to it.
+//
+// Storage:
+//   ~/.gjc/agent/sessions/<slug>/<ts>_<id>.jsonl   full transcript
+//     slug = cwd with $HOME stripped, every '/' → '-'
+//            (/home/u/projects/x → -projects-x)
+//   ~/.gjc/agent/terminal-sessions/tmux-<paneId>   per-pane pointer
+//     line 1 = cwd, line 2 = absolute path of the active session jsonl.
+// The per-pane pointer is authoritative (it names the exact session a
+// given tmux pane is driving); the slug newest-jsonl is the fallback.
+function gjcSlugFor(cwd) {
+  if (!cwd) return null;
+  const rel = cwd.startsWith(HOME) ? cwd.slice(HOME.length) : cwd;
+  return rel.replace(/\//g, '-');
+}
+
+function resolveGjcSessionFile(cwd, mainPaneId) {
+  if (mainPaneId) {
+    const ptr = path.join(GJC_TERMINAL_DIR, 'tmux-' + mainPaneId);
+    try {
+      const jsonl = fs.readFileSync(ptr, 'utf8')
+        .split('\n').map(s => s.trim()).filter(Boolean)
+        .find(l => l.endsWith('.jsonl'));
+      if (jsonl && fs.existsSync(jsonl)) return jsonl;
+    } catch {}
+  }
+  const slug = gjcSlugFor(cwd);
+  if (!slug) return null;
+  const dir = path.join(GJC_SESSIONS_DIR, slug);
+  let best = null;
+  for (const f of safeReaddir(dir)) {
+    if (!f.endsWith('.jsonl')) continue;
+    const st = safeStat(path.join(dir, f));
+    if (st && (!best || st.mtimeMs > best.mtime)) best = { path: path.join(dir, f), mtime: st.mtimeMs };
+  }
+  return best ? best.path : null;
+}
+
+const _gjcMsgCache = new Map(); // path → { size, msgs }
+function parseGjcUserMessages(filePath, stat) {
+  const cached = _gjcMsgCache.get(filePath);
+  if (cached && cached.size === stat.size) return cached.msgs;
+  let text;
+  try { text = fs.readFileSync(filePath, 'utf8'); } catch { return []; }
+  const msgs = [];
+  let order = 0;
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let o;
+    try { o = JSON.parse(line); } catch { continue; }
+    if (!o || o.type !== 'message') continue;
+    const m = o.message;
+    if (!m || m.role !== 'user' || m.attribution !== 'user') continue;
+    let body = '';
+    if (Array.isArray(m.content)) {
+      body = m.content.filter(c => c && c.type === 'text').map(c => c.text || '').join(' ');
+    } else if (typeof m.content === 'string') {
+      body = m.content;
+    }
+    body = body.replace(/\s+/g, ' ').trim();
+    // Drop empties and injected non-typed blobs (system reminders, tool
+    // wrappers) that start with an XML-ish tag — they aren't user input.
+    if (!body || body.startsWith('<')) continue;
+    msgs.push({ subject: body, status: 'message', order: order++, ts: o.timestamp || '' });
+  }
+  _gjcMsgCache.set(filePath, { size: stat.size, msgs });
+  return msgs;
+}
+
+function readGjcSource(cwd, excl, mainPaneId) {
+  const file = resolveGjcSessionFile(cwd, mainPaneId);
+  if (!file) return null;
+  if (excl && excl.paths && excl.paths.has(file)) return null;
+  const st = safeStat(file);
+  if (!st) return null;
+  const msgs = parseGjcUserMessages(file, st);
+  if (!msgs.length) return null;
+  const id = path.basename(file).replace(/\.jsonl$/, '');
+  const shortId = (id.split('_').pop() || id).slice(0, 8);
+  return { source: `gjc · ${shortId}`, tasks: msgs, mtime: st.mtimeMs, kind: 'messages' };
+}
+
 // Walk the sub pane's process tree and collect any open file paths
 // that look like agent session storage. Anything an agent in the sub
 // pane has open is implicitly *not* the main pane's work — we exclude
@@ -2175,7 +2271,12 @@ function walkSubPaneTree(rootPid, out) {
 // alone is the tiebreaker — whatever agent has been writing most
 // recently wins the pane. excl carries the sub-pane sessions to
 // exclude so sub-pane activity never bleeds into the status overlay.
-function pickActiveTaskSource(cwd, excl) {
+function pickActiveTaskSource(cwd, excl, mainPaneId) {
+  // gjc is the primary agent: when its transcript exists, surface the
+  // user's own command history (with click-to-jump). It takes priority
+  // over the task-list sources from other agents.
+  const gjc = readGjcSource(cwd, excl, mainPaneId);
+  if (gjc && gjc.tasks && gjc.tasks.length) return gjc;
   const probes = [
     readClaudeSource(cwd, excl),
     readCodexSource(cwd, excl),
@@ -2245,6 +2346,17 @@ function findMainPaneInWindow(windowTarget) {
   return candidates[0]?.id || null;
 }
 
+// Resolve the main coding pane id for the window that owns a given
+// status-overlay pane. Used to point the gjc transcript reader at the
+// exact pane the user is driving.
+function resolveMainPaneId(statusPaneId) {
+  if (!statusPaneId) return null;
+  const winOut = spawnSync('tmux', ['display-message', '-p', '-t', statusPaneId,
+    '#{session_name}:#{window_index}'], { encoding: 'utf8' });
+  if (winOut.status !== 0) return null;
+  return findMainPaneInWindow(winOut.stdout.trim());
+}
+
 // Click on a status row should surface the corresponding task in
 // the main pane. Two regimes:
 //
@@ -2307,6 +2419,63 @@ function clipDisplayText(s, max) {
   if (text.length <= max) return text;
   if (max <= 1) return text.slice(0, max);
   return text.slice(0, max - 1) + '…';
+}
+
+// Terminal display width of a code point. CJK / fullwidth / emoji
+// occupy two cells; combining marks and variation selectors occupy
+// none. Clipping by String#length (code units) under-counts these and
+// the row soft-wraps — in an alt-screen overlay a wrapped row pushes
+// content down and scrolls the header off the top of the pane.
+function overlayCellWidth(cp) {
+  if (cp === 0x200b ||
+      (cp >= 0x0300 && cp <= 0x036f) ||
+      (cp >= 0x200c && cp <= 0x200f) ||
+      (cp >= 0xfe00 && cp <= 0xfe0f)) {
+    return 0;
+  }
+  if (cp >= 0x1100 && (
+      cp <= 0x115f ||
+      cp === 0x2329 || cp === 0x232a ||
+      (cp >= 0x2e80 && cp <= 0x303e) ||
+      (cp >= 0x3041 && cp <= 0x33ff) ||
+      (cp >= 0x3400 && cp <= 0x4dbf) ||
+      (cp >= 0x4e00 && cp <= 0x9fff) ||
+      (cp >= 0xa000 && cp <= 0xa4cf) ||
+      (cp >= 0xac00 && cp <= 0xd7a3) ||
+      (cp >= 0xf900 && cp <= 0xfaff) ||
+      (cp >= 0xfe10 && cp <= 0xfe19) ||
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||
+      (cp >= 0xff00 && cp <= 0xff60) ||
+      (cp >= 0xffe0 && cp <= 0xffe6) ||
+      (cp >= 0x1f300 && cp <= 0x1faff) ||
+      (cp >= 0x20000 && cp <= 0x3fffd))) {
+    return 2;
+  }
+  return 1;
+}
+
+// Clip a string to at most `maxCells` terminal cells, appending an
+// ellipsis when truncated. Never returns a string wider than maxCells.
+function clipToCells(s, maxCells) {
+  const text = String(s || '').replace(/\s+/g, ' ').trim();
+  if (!Number.isFinite(maxCells) || maxCells <= 0) return '';
+  let total = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i);
+    total += overlayCellWidth(cp);
+    i += cp > 0xffff ? 2 : 1;
+  }
+  if (total <= maxCells) return text;
+  let out = '', width = 0;
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i);
+    const cw = overlayCellWidth(cp);
+    if (width + cw > maxCells - 1) break;   // reserve one cell for '…'
+    out += String.fromCodePoint(cp);
+    width += cw;
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return out + '…';
 }
 
 function statusKoreanLabel(status) {
@@ -2490,7 +2659,8 @@ function taskOverlayDaemon(cwd) {
     const now = Date.now();
     if (!sourceCache.excl || now - sourceCache.at >= SOURCE_SCAN_MS) {
       const excl = collectSubPaneSessions(paneId);
-      sourceCache = { at: now, excl, picked: pickActiveTaskSource(cwd, excl) };
+      const mainPaneId = resolveMainPaneId(paneId);
+      sourceCache = { at: now, excl, picked: pickActiveTaskSource(cwd, excl, mainPaneId) };
     }
     if (!ctxCache.ctx || now - ctxCache.at >= CONTEXT_SCAN_MS) {
       ctxCache = { at: now, ctx: taskOverlayStatusContext(paneId, cwd) };
@@ -2503,6 +2673,53 @@ function taskOverlayDaemon(cwd) {
     if (!tasks.length) {
       lines.push(...renderNoTaskFallbackLines(ctx, sourceLabel, w));
       lastSortedRef = { rowMap: new Map() };
+    } else if (picked && picked.kind === 'messages') {
+      // gjc command-history view: the user's own typed messages, oldest
+      // at top → newest at bottom. The newest row is marked and reflects
+      // whether the agent is still working on it or waiting for input.
+      const working = ctx.status === 'running';
+      const stateTxt = working
+        ? '\x1b[1;33m● 작업 중\x1b[0m'
+        : (ctx.status === 'need-input'
+            ? '\x1b[1;35m● 입력 대기\x1b[0m'
+            : '\x1b[1;32m○ 대기 중\x1b[0m');
+      lines.push(` \x1b[1m내 명령\x1b[0m \x1b[2m${tasks.length}개\x1b[0m   ${stateTxt}`);
+      lines.push('');
+      const ordered = tasks;
+      const h = process.stdout.rows || 24;
+      const reserveTop = 1, reserveBottom = 1;
+      const budget = Math.max(1, h - lines.length - reserveTop - reserveBottom);
+      if (viewportBottom < 0 || autoFollow) viewportBottom = ordered.length - 1;
+      if (viewportBottom >= ordered.length - 1) { viewportBottom = ordered.length - 1; autoFollow = true; }
+      if (viewportBottom < budget - 1) viewportBottom = Math.min(ordered.length - 1, budget - 1);
+      const start = Math.max(0, viewportBottom - budget + 1);
+      const visible = ordered.slice(start, viewportBottom + 1);
+      const aboveCount = start;
+      const belowCount = ordered.length - 1 - viewportBottom;
+      if (aboveCount > 0) {
+        lines.push(`\x1b[2m   ↑ +${aboveCount} 이전 (wheel ↑)\x1b[0m`);
+      } else {
+        lines.push('');
+      }
+      const rowMap = new Map();
+      for (let vi = 0; vi < visible.length; vi++) {
+        const gi = start + vi;
+        const t = visible[vi];
+        const isLast = gi === ordered.length - 1;
+        const sub = String(t.subject || '').replace(/\s+/g, ' ').trim();
+        const num = String(gi + 1).padStart(2);
+        const text = clipToCells(sub, Math.max(1, w - 6));
+        const marker = isLast ? (working ? '\x1b[1;33m▸\x1b[0m' : '\x1b[1;32m▸\x1b[0m') : ' ';
+        const numCol = isLast ? '\x1b[1;38;5;39m' : '\x1b[2m';
+        const bodyStyle = isLast ? '\x1b[1m' : '';
+        const row1 = lines.length + 1;
+        rowMap.set(row1, sub);
+        lines.push(`${marker}${numCol}${num}.\x1b[0m ${bodyStyle}${text}\x1b[0m`);
+      }
+      if (belowCount > 0) {
+        lines.push(`\x1b[2m   ↓ +${belowCount} 최신 (wheel ↓)\x1b[0m`);
+      }
+      lastSortedRef = { rowMap };
     } else {
       // Two-bucket stack: completed [x] above, todo [ ] below.
       // Within each bucket, oldest at top → newest at bottom. This
@@ -3500,11 +3717,17 @@ if (require.main === module) {
   module.exports = {
     clipDisplayText,
     computeResponsiveLayout,
+    isWideAspect,
     responsiveSidebarWidth,
     statusKoreanLabel,
     renderTaskOverlaySummaryLines,
     renderNoTaskFallbackLines,
     sanitizeTitle,
     paneRoleOf,
+    clipToCells,
+    gjcSlugFor,
+    parseGjcUserMessages,
+    resolveGjcSessionFile,
+    readGjcSource,
   };
 }

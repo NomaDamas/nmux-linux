@@ -1,7 +1,41 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const overlay = require('../bin/nmux-linux');
+
+test('parseGjcUserMessages extracts only user-typed messages, trimmed and ordered', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gjc-test-'));
+  const fp = path.join(dir, 'session.jsonl');
+  const recs = [
+    { type: 'session', version: 3 },
+    { type: 'message', message: { role: 'user', attribution: 'user', content: [{ type: 'text', text: '첫 명령' }] } },
+    { type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: '답변' }] } },
+    { type: 'message', message: { role: 'user', attribution: 'user', content: [{ type: 'text', text: '  둘째   명령  ' }] } },
+    { type: 'message', message: { role: 'user', attribution: 'toolResult', content: [{ type: 'text', text: '도구 결과' }] } },
+    { type: 'message', message: { role: 'user', attribution: 'user', content: [{ type: 'text', text: '<system-reminder>무시</system-reminder>' }] } },
+  ];
+  fs.writeFileSync(fp, recs.map(r => JSON.stringify(r)).join('\n') + '\n');
+  const msgs = overlay.parseGjcUserMessages(fp, fs.statSync(fp));
+  assert.deepEqual(msgs.map(m => m.subject), ['첫 명령', '둘째 명령']);
+  assert.deepEqual(msgs.map(m => m.order), [0, 1]);
+  assert.ok(msgs.every(m => m.status === 'message'));
+});
+
+test('clipToCells truncates by terminal display width, not code-unit length', () => {
+  // 10 Korean syllables = 20 cells. Fits within 24, must not be clipped.
+  assert.equal(overlay.clipToCells('가나다라마바사아자차', 24), '가나다라마바사아자차');
+  // Clipped result must never exceed the cell budget (wide chars + …).
+  const clipped = overlay.clipToCells('가나다라마바사아자차카타파하', 12);
+  const cells = [...clipped].reduce((n, ch) => {
+    const cp = ch.codePointAt(0);
+    return n + ((cp >= 0xac00 && cp <= 0xd7a3) ? 2 : 1);
+  }, 0);
+  assert.ok(cells <= 12, `clipped width ${cells} must be <= 12`);
+  assert.ok(clipped.endsWith('…'));
+});
 
 test('no-task overlay fallback shows Korean status dashboard', () => {
   const ctx = {
@@ -43,6 +77,21 @@ test('responsive layout keeps full auxiliary column on wide screens', () => {
   assert.ok(p.subWidth >= 40);
   assert.ok(p.mainWidth > p.subWidth);
   assert.ok(p.rightWidth >= 24);
+});
+
+test('wide-but-not-ultrawide monitor gets an extra far-right pane instead of over-wide main', () => {
+  // 179x52 (~3.44:1) is a normal wide monitor, not ultrawide. The old
+  // aspect-only gate (>=4.0) left main stretched to ~122 cells with no
+  // auxiliary pane. It must now qualify for the sub pane.
+  assert.equal(overlay.isWideAspect(179, 52), true);
+  const p = overlay.computeResponsiveLayout(179, 52, 26, { hasRight: true, wantSub: true });
+  assert.equal(p.mode, 'wide');
+  assert.ok(p.subWidth >= 40, `expected an extra pane, got subWidth=${p.subWidth}`);
+  assert.ok(p.mainWidth >= 50, 'main pane keeps its minimum width');
+  // small / short clients must still stay 3-column (room gate).
+  assert.equal(overlay.isWideAspect(110, 30), false);
+  const small = overlay.computeResponsiveLayout(92, 28, 26, { hasRight: true, wantSub: true });
+  assert.ok(small.subWidth <= 12);
 });
 
 test('responsive layout collapses an existing sub pane instead of killing small-screen usability', () => {
