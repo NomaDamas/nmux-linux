@@ -30,8 +30,8 @@ test('node interpreter is invoked by absolute path for tmux commands (#9/#11)', 
 
 test('mouse + wheel bindings run via NMUX_RUN, never the bare env-node script (#9)', () => {
   const mouseup = SRC.match(/bind-key -T root MouseUp1Pane run-shell[^\n]*/)[0];
-  const wheelUp = SRC.match(/bind-key -T root WheelUpPane run-shell[^\n]*/)[0];
-  const wheelDn = SRC.match(/bind-key -T root WheelDownPane run-shell[^\n]*/)[0];
+  const wheelUp = SRC.match(/bind-key -T root WheelUpPane [^\n]*/)[0];
+  const wheelDn = SRC.match(/bind-key -T root WheelDownPane [^\n]*/)[0];
   for (const [name, line] of [['MouseUp', mouseup], ['WheelUp', wheelUp], ['WheelDown', wheelDn]]) {
     assert.ok(line.includes('${NMUX_RUN}'),
       `${name} binding must invoke node via NMUX_RUN, got: ${line}`);
@@ -42,14 +42,25 @@ test('mouse + wheel bindings run via NMUX_RUN, never the bare env-node script (#
 
 test('mouse + wheel bindings do not forward #{pane_title} on the command line (#11)', () => {
   const mouseup = SRC.match(/bind-key -T root MouseUp1Pane run-shell[^\n]*/)[0];
-  const wheelUp = SRC.match(/bind-key -T root WheelUpPane run-shell[^\n]*/)[0];
-  const wheelDn = SRC.match(/bind-key -T root WheelDownPane run-shell[^\n]*/)[0];
+  const wheelUp = SRC.match(/bind-key -T root WheelUpPane [^\n]*/)[0];
+  const wheelDn = SRC.match(/bind-key -T root WheelDownPane [^\n]*/)[0];
   for (const [name, line] of [['MouseUp', mouseup], ['WheelUp', wheelUp], ['WheelDown', wheelDn]]) {
     assert.ok(!line.includes('#{pane_title}'),
       `${name} binding must resolve the title in-process, not pass #{pane_title}: ${line}`);
     assert.ok(line.includes('#{pane_id}'),
       `${name} binding must still pass the safe #{pane_id}: ${line}`);
   }
+});
+
+test('wheel-up on the main pane enters copy-mode natively, without a node spawn', () => {
+  // Perf: routing every wheel tick through `run-shell node …` cost a ~150ms
+  // node cold start before copy-mode opened. Only sidebar/status panes go
+  // through node now; the common panes use tmux's native copy-mode -e.
+  const wheelUp = SRC.match(/bind-key -T root WheelUpPane [^\n]*/)[0];
+  assert.ok(wheelUp.includes('copy-mode -e'),
+    `WheelUp must fall back to native copy-mode for the hot path: ${wheelUp}`);
+  assert.ok(/if-shell -F "\$\{wheelSpecialCond\}"/.test(wheelUp),
+    'WheelUp must gate the node route behind the sidebar/status condition');
 });
 
 test('the new-project popup execs node by absolute path (#10)', () => {

@@ -319,6 +319,13 @@ function applyTmuxLines(lines) {
 }
 
 function installBindings(session) {
+  // Wheel routing conditions. `special` = sidebar pane (swallow the wheel)
+  // or a status pane (forward the wheel to the overlay daemon); only these
+  // need the node helper. `passthru` = the pane is already in copy-mode or
+  // the running app requested mouse tracking, so the wheel should be sent
+  // to it rather than entering copy-mode.
+  const wheelSpecialCond = `#{&&:#{==:#{session_name},${session}},#{||:#{==:#{pane_title},nmux-linux-sidebar},#{m:*-status,#{pane_title}}}}`;
+  const wheelPassthruCond = `#{||:#{pane_in_mode},#{mouse_any_flag}}`;
   const lines = [
     // Session-level
     `set-option -t ${session} status off`,
@@ -381,14 +388,15 @@ function installBindings(session) {
     // shell parsing entirely (issue #11).
     `bind-key -T root MouseUp1Pane run-shell -b '${NMUX_RUN} mouseup #{pane_id} #{mouse_y} #{mouse_x}'`,
 
-    // Wheel routing: a tiny node helper does the 3-way dispatch
-    // (sidebar swallow / right-top → daemon / else → copy-mode).
-    // Nested tmux if-shell quoting was unmanageable across two
-    // levels, so we move the routing out of the tmux config.
-    // session_name / pane_title are fetched from the pane-id in the
-    // handler for the same reason as mouseup (issue #11).
-    `bind-key -T root WheelUpPane run-shell -b '${NMUX_RUN} wheel up #{pane_id} #{pane_in_mode} #{mouse_any_flag}'`,
-    `bind-key -T root WheelDownPane run-shell -b '${NMUX_RUN} wheel down #{pane_id} #{pane_in_mode} #{mouse_any_flag}'`,
+    // Wheel routing. Only the sidebar (swallow) and status panes (forward
+    // the wheel to the overlay daemon) go through node — they are rare, so
+    // a node spawn there is fine. The HOT path — wheel on the main / sub /
+    // bash panes — is handled NATIVELY by tmux so scroll-up enters copy-mode
+    // instantly instead of waiting ~150ms for a node cold start on every
+    // wheel tick. Brace blocks (tmux 3.0+) sidestep the nested-quote parsing
+    // that previously forced all-node routing.
+    `bind-key -T root WheelUpPane if-shell -F "${wheelSpecialCond}" { run-shell -b "${NMUX_RUN} wheel up #{pane_id} #{pane_in_mode} #{mouse_any_flag}" } { if-shell -F "${wheelPassthruCond}" { send-keys -M } { copy-mode -e } }`,
+    `bind-key -T root WheelDownPane if-shell -F "${wheelSpecialCond}" { run-shell -b "${NMUX_RUN} wheel down #{pane_id} #{pane_in_mode} #{mouse_any_flag}" } { send-keys -M }`,
 
     // Double-click on a non-sidebar nmux-linux pane fires only the URL
     // launcher (background): capture pane wrap-joined, find the URL on
@@ -2669,9 +2677,9 @@ function taskOverlayDaemon(cwd) {
   const CONTEXT_SCAN_MS = Math.max(3000, Number(process.env.NMUX_TASK_CONTEXT_SCAN_MS || 10000));
 
   function applyEvents() {
-    if (!paneId) return;
+    if (!paneId) return false;
     const events = readAndClearTaskEvents(paneId);
-    if (!events.length) return;
+    if (!events.length) return false;
     for (const e of events) {
       if (e === 'SCROLL UP') {
         // see older — viewport bottom moves up by 1
@@ -2695,6 +2703,7 @@ function taskOverlayDaemon(cwd) {
         }
       }
     }
+    return true;
   }
 
   function render() {
@@ -2848,19 +2857,24 @@ function taskOverlayDaemon(cwd) {
     }
   }
   function tick() {
-    applyEvents();
     render();
   }
-  tick();
-  // Local performance patch: the old 200ms loop was too aggressive.
-  // It repeatedly walks process trees and task sources; with several open
-  // projects this saturated CPU and made Codex/OMX appear stuck at Working.
-  // Default to 10s; allow temporary override for debugging.
+  tick();   // initial render populates the click rowMap before any event
+  // Event polling is decoupled from the heavy render tick. Clicks and
+  // wheel-scrolls land in a small per-pane queue file; poll it frequently
+  // so a status-row click jumps the main pane within ~100ms instead of
+  // waiting up to a full render interval (the source/context scans inside
+  // render are independently throttled by their own caches, so this poll
+  // stays cheap — it only re-renders when an event actually changed state).
+  const EVENT_POLL_MS = Math.max(40, Number(process.env.NMUX_TASK_EVENT_POLL_MS || 100));
+  const eventTimer = setInterval(() => { if (applyEvents()) render(); }, EVENT_POLL_MS);
+  // Periodic refresh (task sources, status context). Heavy bits cached.
   const TASK_OVERLAY_TICK_MS = Math.max(3000, Number(process.env.NMUX_TASK_OVERLAY_TICK_MS || 10000));
   const timer = setInterval(tick, TASK_OVERLAY_TICK_MS);
   function exit() {
     try { process.stdout.write('\x1b[?1049l'); } catch {}
     clearInterval(timer);
+    clearInterval(eventTimer);
     process.exit(0);
   }
   process.on('SIGTERM', exit);
