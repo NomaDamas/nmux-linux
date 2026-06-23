@@ -324,6 +324,13 @@ function installBindings(session) {
     `set-option -t ${session} status off`,
     `set-option -t ${session} base-index 1`,
     `set-option -t ${session} mouse on`,
+    // Size each window to the CURRENTLY-attached client, not the largest
+    // client that ever viewed it. nmux-linux is a single-user frontend;
+    // with the default `largest`, moving from an ultrawide back to a 16:9
+    // monitor left windows stuck at the ultrawide width, so the layout
+    // kept showing the ultrawide-only sub pane. `latest` makes the layout
+    // track the monitor you are actually on.
+    `set-option -t ${session} window-size latest`,
 
     // Keep per-pane border titles, but hide the one above the sidebar pane.
     // (Per-window pane-border-format set in scrubWindowStatus.)
@@ -541,13 +548,10 @@ function buildLayout(cfg, target, project, cwd, shell) {
 function isWideAspect(winW, winH) {
   if (!Number.isFinite(winW)) return false;
   if (winW >= 300) return true;
-  // Absolute-width trigger: on an ordinary wide monitor there can be lots
-  // of leftover horizontal space without the window being ultra-wide by
-  // aspect ratio. Once the window is this wide, prefer spending the slack
-  // on an extra far-right pane rather than over-stretching the main pane.
-  // computeResponsiveLayout still gates the sub pane on there being real
-  // room (minMain + SUB_MIN_WIDTH), so narrow/short clients stay 3-column.
-  if (winW >= 140) return true;
+  // Aspect-only: a normal 16:9 monitor is ~3.4-3.5 in cell ratio and must
+  // stay 3-column (no sub pane), even at high resolution where it spans
+  // many columns. Only genuine ultrawide (>=4.0) earns the extra far-right
+  // pane.
   if (!Number.isFinite(winH) || winH <= 0) return false;
   return (winW / winH) >= 4.0;
 }
@@ -1168,23 +1172,32 @@ function ensureSubPane(cfg, info) {
     hasSub: info.panes.some(p => paneRoleOf(p.title) === 'sub'),
     wantSub: isWideAspect(info.winW, info.winH),
   });
-  if (!plan.canFullSub || plan.subWidth <= 0) return;
+  // All sub panes currently in the window (normally 0 or 1, but a racing
+  // resize hook can briefly leave duplicates — handle them defensively).
+  const subs = info.panes.filter(p => paneRoleOf(p.title) === 'sub');
+  const killSub = (p) => {
+    tmux(['kill-pane', '-t', p.pid], { allowFail: true });
+    info.panes = info.panes.filter(x => x.pid !== p.pid);
+  };
+
+  if (!plan.canFullSub || plan.subWidth <= 0) {
+    // Not ultrawide (e.g. a normal 16:9 monitor): there must be NO sub
+    // pane. Remove every previously-created one so switching from an
+    // ultrawide client back to 16:9 collapses to the 3-column layout.
+    for (const p of subs) killSub(p);
+    return;
+  }
   const main = info.panes.find(p => paneRoleOf(p.title) === 'main')
     || info.panes.find(p => !p.isSidebar && !isReservedPaneTitle(p.title));
   if (!main) return;
   const winTarget = `${cfg.session}:${info.idx}`;
 
-  // The sub pane must be a full-height column at the FAR RIGHT — not
-  // wedged between main and the status column. An existing sub that is
-  // not already the rightmost pane is relocated (kill + recreate); this
-  // is a one-shot per window since afterwards it is rightmost and the
-  // check below short-circuits.
-  const existingSub = info.panes.find(p => paneRoleOf(p.title) === 'sub');
-  if (existingSub) {
-    if (existingSub.pid === rightmostPaneId(winTarget)) return;  // already far right
-    tmux(['kill-pane', '-t', existingSub.pid], { allowFail: true });
-    info.panes = info.panes.filter(p => p.pid !== existingSub.pid);
-  }
+  // Ultrawide: keep EXACTLY one sub pane, a full-height column at the FAR
+  // RIGHT (not wedged between main and the status column). If a single sub
+  // already sits at the rightmost edge we are done; otherwise drop every
+  // existing sub and recreate one in the right place (one-shot).
+  if (subs.length === 1 && subs[0].pid === rightmostPaneId(winTarget)) return;
+  for (const p of subs) killSub(p);
 
   const project = (cfg.projects || []).find(p => p.name === info.proj);
   const cwd = (project && project.cwd) || info.paneCwd || HOME;

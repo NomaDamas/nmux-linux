@@ -79,19 +79,20 @@ test('responsive layout keeps full auxiliary column on wide screens', () => {
   assert.ok(p.rightWidth >= 24);
 });
 
-test('wide-but-not-ultrawide monitor gets an extra far-right pane instead of over-wide main', () => {
-  // 179x52 (~3.44:1) is a normal wide monitor, not ultrawide. The old
-  // aspect-only gate (>=4.0) left main stretched to ~122 cells with no
-  // auxiliary pane. It must now qualify for the sub pane.
-  assert.equal(overlay.isWideAspect(179, 52), true);
-  const p = overlay.computeResponsiveLayout(179, 52, 26, { hasRight: true, wantSub: true });
-  assert.equal(p.mode, 'wide');
-  assert.ok(p.subWidth >= 40, `expected an extra pane, got subWidth=${p.subWidth}`);
-  assert.ok(p.mainWidth >= 50, 'main pane keeps its minimum width');
-  // small / short clients must still stay 3-column (room gate).
-  assert.equal(overlay.isWideAspect(110, 30), false);
-  const small = overlay.computeResponsiveLayout(92, 28, 26, { hasRight: true, wantSub: true });
-  assert.ok(small.subWidth <= 12);
+test('16:9 monitors stay 3-column (no sub pane); only ultrawide gets one', () => {
+  // A normal 16:9 monitor is ~3.4-3.5:1 in terminal cells even at high
+  // resolution where it spans many columns. It must NOT get a sub pane.
+  assert.equal(overlay.isWideAspect(179, 52), false);   // 3.44:1, 16:9
+  assert.equal(overlay.isWideAspect(240, 67), false);   // 3.58:1, high-res 16:9
+  const wide169 = overlay.computeResponsiveLayout(179, 52, 26, { hasRight: true, wantSub: true });
+  assert.equal(wide169.subWidth, 0, '16:9 must stay 3-column');
+  assert.notEqual(wide169.mode, 'wide');
+
+  // Genuine ultrawide (>=4.0) earns the extra far-right pane.
+  assert.equal(overlay.isWideAspect(260, 45), true);    // 5.78:1, 21:9
+  const ultra = overlay.computeResponsiveLayout(260, 45, 26, { hasRight: true, wantSub: true });
+  assert.equal(ultra.mode, 'wide');
+  assert.ok(ultra.subWidth >= 40, `expected an extra pane, got subWidth=${ultra.subWidth}`);
 });
 
 test('responsive layout collapses an existing sub pane instead of killing small-screen usability', () => {
