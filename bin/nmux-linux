@@ -1711,8 +1711,6 @@ const CLAUDE_PROJECTS_DIR = path.join(HOME, '.claude', 'projects');
 const OPENCODE_TASKS_DIR = path.join(HOME, '.config', 'opencode', 'tasks');
 const TASK_OVERLAY_TICK_MS = 2000;
 const GJC_SESSIONS_DIR = path.join(HOME, '.gjc', 'agent', 'sessions');
-const GJC_TERMINAL_DIR = path.join(HOME, '.gjc', 'agent', 'terminal-sessions');
-
 // Encode a cwd the way Claude Code names its project slugs: any `/`
 // or `.` becomes `-`. Anchor with a leading `-` so it matches the
 // directory naming on disk (e.g. /home/user/projects/example →
@@ -2143,46 +2141,44 @@ function readTodoSource(cwd) {
 }
 
 // --- gjc (gajae coding agent) source ---
-// gjc is the primary agent in this workspace. Unlike the task-list
-// sources above, the status pane for gjc surfaces the USER'S OWN typed
-// messages — the command history — so the operator can see at a glance
-// what they asked for, whether the last command is still running or
-// waiting, and click any of them to jump the main pane back to it.
+// gjc is the primary agent in this workspace. The status pane surfaces the
+// USER'S OWN typed messages — the command history — so the operator can see
+// what they asked for, whether the last command is running or waiting, and
+// click any of them to jump the main pane back to it.
 //
-// Storage:
-//   ~/.gjc/agent/sessions/<slug>/<ts>_<id>.jsonl   full transcript
-//     slug = cwd with $HOME stripped, every '/' → '-'
-//            (/home/u/projects/x → -projects-x)
-//   ~/.gjc/agent/terminal-sessions/tmux-<paneId>   per-pane pointer
-//     line 1 = cwd, line 2 = absolute path of the active session jsonl.
-// The per-pane pointer is authoritative (it names the exact session a
-// given tmux pane is driving); the slug newest-jsonl is the fallback.
+// Storage: ~/.gjc/agent/sessions/<slug>/<ts>_<id>.jsonl
+//   slug = cwd with $HOME stripped, every '/' → '-' (~/projects/x → -projects-x)
+//
+// We aggregate user messages across ALL top-level session transcripts for
+// the project's slug, merged chronologically and de-duplicated. This is
+// deliberately NOT driven by the per-pane terminal-sessions pointer: that
+// pointer can name a transient sandbox session in another cwd (e.g.
+// /tmp/<rand> from a tool run) or a file that has since been removed, which
+// made whole projects show nothing or only part of their history. The slug
+// directory holds exactly the sessions whose cwd is this project, so reading
+// every top-level transcript there is both complete and correctly scoped.
+// Nested subdirectories (named after a parent session id) hold SUBAGENT
+// transcripts, not the user's conversation, and are intentionally skipped.
 function gjcSlugFor(cwd) {
   if (!cwd) return null;
   const rel = cwd.startsWith(HOME) ? cwd.slice(HOME.length) : cwd;
   return rel.replace(/\//g, '-');
 }
 
-function resolveGjcSessionFile(cwd, mainPaneId) {
-  if (mainPaneId) {
-    const ptr = path.join(GJC_TERMINAL_DIR, 'tmux-' + mainPaneId);
-    try {
-      const jsonl = fs.readFileSync(ptr, 'utf8')
-        .split('\n').map(s => s.trim()).filter(Boolean)
-        .find(l => l.endsWith('.jsonl'));
-      if (jsonl && fs.existsSync(jsonl)) return jsonl;
-    } catch {}
-  }
+const GJC_SESSION_FILE_LIMIT = 24;  // cap parsing on projects with long history
+function listGjcSessionFiles(cwd) {
   const slug = gjcSlugFor(cwd);
-  if (!slug) return null;
+  if (!slug) return [];
   const dir = path.join(GJC_SESSIONS_DIR, slug);
-  let best = null;
+  const out = [];
   for (const f of safeReaddir(dir)) {
     if (!f.endsWith('.jsonl')) continue;
-    const st = safeStat(path.join(dir, f));
-    if (st && (!best || st.mtimeMs > best.mtime)) best = { path: path.join(dir, f), mtime: st.mtimeMs };
+    const fp = path.join(dir, f);
+    const st = safeStat(fp);
+    if (st && st.isFile()) out.push({ path: fp, mtime: st.mtimeMs, stat: st });
   }
-  return best ? best.path : null;
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out.slice(0, GJC_SESSION_FILE_LIMIT);
 }
 
 const _gjcMsgCache = new Map(); // path → { size, msgs }
@@ -2216,17 +2212,29 @@ function parseGjcUserMessages(filePath, stat) {
   return msgs;
 }
 
-function readGjcSource(cwd, excl, mainPaneId) {
-  const file = resolveGjcSessionFile(cwd, mainPaneId);
-  if (!file) return null;
-  if (excl && excl.paths && excl.paths.has(file)) return null;
-  const st = safeStat(file);
-  if (!st) return null;
-  const msgs = parseGjcUserMessages(file, st);
-  if (!msgs.length) return null;
-  const id = path.basename(file).replace(/\.jsonl$/, '');
-  const shortId = (id.split('_').pop() || id).slice(0, 8);
-  return { source: `gjc · ${shortId}`, tasks: msgs, mtime: st.mtimeMs, kind: 'messages' };
+function readGjcSource(cwd, excl) {
+  const files = listGjcSessionFiles(cwd);
+  if (!files.length) return null;
+  const seen = new Set();
+  const merged = [];
+  let mtime = 0;
+  for (const f of files) {
+    if (excl && excl.paths && excl.paths.has(f.path)) continue;
+    if (f.mtime > mtime) mtime = f.mtime;
+    for (const m of parseGjcUserMessages(f.path, f.stat)) {
+      const key = (m.ts || '') + '\u0000' + m.subject;
+      if (seen.has(key)) continue;           // de-dupe replays across sessions
+      seen.add(key);
+      // Copy out of the per-file cache so reassigning order below never
+      // mutates the cached objects.
+      merged.push({ subject: m.subject, status: 'message', ts: m.ts || '' });
+    }
+  }
+  if (!merged.length) return null;
+  // Chronological across all sessions (ISO timestamps sort lexically).
+  merged.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+  merged.forEach((m, i) => { m.order = i; });
+  return { source: `gjc · ${path.basename(cwd) || 'project'}`, tasks: merged, mtime, kind: 'messages' };
 }
 
 // Walk the sub pane's process tree and collect any open file paths
@@ -2326,11 +2334,11 @@ function walkSubPaneTree(rootPid, out) {
 // alone is the tiebreaker — whatever agent has been writing most
 // recently wins the pane. excl carries the sub-pane sessions to
 // exclude so sub-pane activity never bleeds into the status overlay.
-function pickActiveTaskSource(cwd, excl, mainPaneId) {
+function pickActiveTaskSource(cwd, excl) {
   // gjc is the primary agent: when its transcript exists, surface the
   // user's own command history (with click-to-jump). It takes priority
   // over the task-list sources from other agents.
-  const gjc = readGjcSource(cwd, excl, mainPaneId);
+  const gjc = readGjcSource(cwd, excl);
   if (gjc && gjc.tasks && gjc.tasks.length) return gjc;
   const probes = [
     readClaudeSource(cwd, excl),
@@ -2401,16 +2409,6 @@ function findMainPaneInWindow(windowTarget) {
   return candidates[0]?.id || null;
 }
 
-// Resolve the main coding pane id for the window that owns a given
-// status-overlay pane. Used to point the gjc transcript reader at the
-// exact pane the user is driving.
-function resolveMainPaneId(statusPaneId) {
-  if (!statusPaneId) return null;
-  const winOut = spawnSync('tmux', ['display-message', '-p', '-t', statusPaneId,
-    '#{session_name}:#{window_index}'], { encoding: 'utf8' });
-  if (winOut.status !== 0) return null;
-  return findMainPaneInWindow(winOut.stdout.trim());
-}
 
 // Click on a status row should surface the corresponding task in
 // the main pane. Two regimes:
@@ -2715,8 +2713,7 @@ function taskOverlayDaemon(cwd) {
     const now = Date.now();
     if (!sourceCache.excl || now - sourceCache.at >= SOURCE_SCAN_MS) {
       const excl = collectSubPaneSessions(paneId);
-      const mainPaneId = resolveMainPaneId(paneId);
-      sourceCache = { at: now, excl, picked: pickActiveTaskSource(cwd, excl, mainPaneId) };
+      sourceCache = { at: now, excl, picked: pickActiveTaskSource(cwd, excl) };
     }
     if (!ctxCache.ctx || now - ctxCache.at >= CONTEXT_SCAN_MS) {
       ctxCache = { at: now, ctx: taskOverlayStatusContext(paneId, cwd) };
@@ -3791,7 +3788,7 @@ if (require.main === module) {
     clipToCells,
     gjcSlugFor,
     parseGjcUserMessages,
-    resolveGjcSessionFile,
+    listGjcSessionFiles,
     readGjcSource,
   };
 }
