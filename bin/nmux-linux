@@ -159,6 +159,7 @@ Usage:
   nmux-linux notify --project N --status done|failed|need-input|running [--message M]
   nmux-linux notify-current --status ...   resolve project from current TMUX pane
   nmux-linux add <name> <path>     append project to registry
+  nmux-linux label <project> [name]  set/clear friendly display label; cwd is unchanged
   nmux-linux rm <name>             remove project from registry
 `;
 
@@ -249,6 +250,29 @@ function scanProjects() {
 }
 function defaultProject(name, cwd) {
   return { name, cwd, notifyOnFinish: true };
+}
+function projectDisplayName(project) {
+  return String(project && (project.displayName || project.name) || '').trim();
+}
+function projectFolderName(project) {
+  return path.basename(String(project && project.cwd || '')) || projectDisplayName(project);
+}
+function projectDisplayTitle(project) {
+  const label = projectDisplayName(project);
+  const folder = projectFolderName(project);
+  return label && folder && label !== folder ? `${label} · ${folder}` : (label || folder);
+}
+function projectWindowName(project) {
+  return sanitizeTitle(projectDisplayTitle(project) || project.name || 'project');
+}
+
+function findProjectByKey(cfg, key) {
+  const needle = String(key || '').trim();
+  if (!needle) return null;
+  return (cfg.projects || []).find(p => p.name === needle)
+    || (cfg.projects || []).find(p => projectDisplayName(p) === needle)
+    || (cfg.projects || []).find(p => p.cwd === needle)
+    || null;
 }
 function initConfig({ force = false } = {}) {
   ensureConfigDir();
@@ -462,7 +486,7 @@ function buildWindow(cfg, project, isFirst) {
 
   let idx;
   if (isFirst) {
-    tmux(['new-session', '-d', '-s', cfg.session, '-n', project.name, '-c', cwd, shell]);
+    tmux(['new-session', '-d', '-s', cfg.session, '-n', projectWindowName(project), '-c', cwd, shell]);
     installBindings(cfg.session);
     // The session has exactly one window now — read its index back instead
     // of trusting display-message, which under `-t SESSION` (no window
@@ -475,10 +499,13 @@ function buildWindow(cfg, project, isFirst) {
     // Pin the index explicitly so `set-window-option -t SESSION:idx ...`
     // for the brand-new window can never collide with an existing one.
     idx = String(nextWindowIndex(cfg.session));
-    tmux(['new-window', '-t', `${cfg.session}:${idx}`, '-n', project.name, '-c', cwd, shell]);
+    tmux(['new-window', '-t', `${cfg.session}:${idx}`, '-n', projectWindowName(project), '-c', cwd, shell]);
   }
   const target = `${cfg.session}:${idx}`;
   tmux(['set-window-option', '-t', target, '@nmuxlinux_project', project.name]);
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_project_display', projectDisplayName(project)]);
+  tmux(['set-window-option', '-t', target, '@nmuxlinux_project_folder', projectFolderName(project)]);
+  tmux(['rename-window', '-t', target, projectWindowName(project)], { allowFail: true });
   setWindowStatus(target, 'idle', '');
   // strip tabs on this window
   tmux(['set-window-option', '-t', target, 'window-status-format', ' '], { allowFail: true });
@@ -768,14 +795,14 @@ function openProject(arg) {
     if (n === proj.name) {
       tmux(['select-window', '-t', `${cfg.session}:${idx}`]);
       nudgeSidebars();
-      userMsg(`nmux-linux: switched to ${proj.name}`);
+      userMsg(`nmux-linux: switched to ${projectDisplayTitle(proj)}`);
       return;
     }
   }
   buildWindow(cfg, proj, false);
   captureAndSaveOpen(cfg.session);
   nudgeSidebars();
-  userMsg(`nmux-linux: opened ${proj.name} (${proj.cwd})`, 3500);
+  userMsg(`nmux-linux: opened ${projectDisplayTitle(proj)} (${proj.cwd})`, 3500);
 }
 
 function closeWindow(idx) {
@@ -2393,6 +2420,32 @@ function readAndClearTaskEvents(paneId) {
   return text.split('\n').map(s => s.trim()).filter(Boolean);
 }
 
+function writeTaskRowmap(paneId, rowMap, width, height) {
+  if (!paneId || !rowMap) return;
+  const rows = {};
+  for (const [row, subject] of rowMap.entries()) rows[String(row)] = subject;
+  try {
+    fs.mkdirSync(TASK_EVENT_DIR, { recursive: true });
+    writeAtomic(taskRowmapFile(paneId), JSON.stringify({
+      at: Date.now(),
+      width: Number(width) || 0,
+      height: Number(height) || 0,
+      rows,
+    }) + '\n');
+  } catch {}
+}
+
+function readTaskClickSubject(paneId, y, maxAgeMs = 5000) {
+  if (!paneId || !Number.isFinite(y)) return '';
+  try {
+    const fp = taskRowmapFile(paneId);
+    const st = fs.statSync(fp);
+    if (Date.now() - st.mtimeMs > maxAgeMs) return '';
+    const data = JSON.parse(fs.readFileSync(fp, 'utf8'));
+    return String((data.rows || {})[String(y)] || '');
+  } catch { return ''; }
+}
+
 // Resolve the "main coding pane" for a given window. Layout is
 // sidebar | main | code-mid | right-top/right-bot, so the main is
 // the pane whose title isn't reserved and which sits leftmost (after
@@ -2407,6 +2460,36 @@ function findMainPaneInWindow(windowTarget) {
     .map(([id, title, left]) => ({ id, title, left: parseInt(left, 10) }))
     .sort((a, b) => a.left - b.left);
   return candidates[0]?.id || null;
+}
+
+function taskSearchSnippet(subject) {
+  return String(subject || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+}
+
+function searchableSubjectsFromText(subjects, text) {
+  const haystack = String(text || '').replace(/\s+/g, ' ');
+  const ok = new Set();
+  for (const subject of subjects || []) {
+    const snippet = taskSearchSnippet(subject);
+    if (snippet && haystack.includes(snippet)) ok.add(subject);
+  }
+  return ok;
+}
+
+function mainPaneSearchTextForStatusPane(statusPaneId) {
+  const winOut = spawnSync('tmux', ['display-message', '-p', '-t', statusPaneId,
+    '#{session_name}:#{window_index}'], { encoding: 'utf8' });
+  if (winOut.status !== 0) return null;
+  const mainPane = findMainPaneInWindow(winOut.stdout.trim());
+  if (!mainPane) return null;
+  const out = spawnSync('tmux', ['capture-pane', '-J', '-p', '-t', mainPane, '-S', '-3000'], { encoding: 'utf8' });
+  return out.status === 0 ? out.stdout : null;
+}
+
+function searchableSubjectsForStatusPane(statusPaneId, subjects) {
+  const text = mainPaneSearchTextForStatusPane(statusPaneId);
+  if (text == null) return new Set(subjects || []);
+  return searchableSubjectsFromText(subjects, text);
 }
 
 
@@ -2588,13 +2671,15 @@ function taskOverlayStatusContext(paneId, cwd) {
   };
   if (!paneId) return base;
   const out = spawnSync('tmux', ['display-message', '-p', '-t', paneId,
-    '#{session_name}:#{window_index}\t#{@nmuxlinux_project}\t#{@nmuxlinux_status}\t#{@nmuxlinux_message}'],
+    '#{session_name}:#{window_index}\t#{@nmuxlinux_project}\t#{@nmuxlinux_project_display}\t#{@nmuxlinux_project_folder}\t#{@nmuxlinux_status}\t#{@nmuxlinux_message}'],
     { encoding: 'utf8' });
   if (out.status !== 0) return base;
-  const [winTarget, project, status, message] = out.stdout.trimEnd().split('\t');
+  const [winTarget, project, displayName, folderName, status, message] = out.stdout.trimEnd().split('\t');
   const ctx = {
     ...base,
-    project: project || base.project,
+    project: displayName || project || base.project,
+    projectKey: project || base.project,
+    projectFolder: folderName || path.basename(cwd || base.mainCwd || '') || '',
     status: status || 'idle',
     message: message || '',
   };
@@ -2625,6 +2710,9 @@ function renderTaskOverlaySummaryLines(ctx, sourceLabel, w) {
   lines.push(`\x1b[1;38;5;39m  상태판\x1b[0m  \x1b[2m· ${project}\x1b[0m`);
   lines.push('\x1b[2m' + '─'.repeat(Math.min(width - 1, 60)) + '\x1b[0m');
   lines.push(` \x1b[1m상태\x1b[0m  ${statusColor(status)}${statusKoreanLabel(status)}\x1b[0m`);
+  if (ctx.projectFolder && ctx.projectFolder !== ctx.project) {
+    lines.push(` \x1b[1m폴더\x1b[0m  ${clipDisplayText(ctx.mainCwd || ctx.projectFolder, Math.max(8, width - 10))}`);
+  }
   if (ctx.message) {
     lines.push(` \x1b[1m메시지\x1b[0m  ${clipDisplayText(ctx.message, Math.max(8, width - 10))}`);
   }
@@ -2699,6 +2787,9 @@ function taskOverlayDaemon(cwd) {
           const subject = lastSortedRef.rowMap.get(y);
           if (subject) jumpMainPaneToTask(paneId, subject);
         }
+      } else if (e.startsWith('JUMP ')) {
+        const subject = e.slice(5).trim();
+        if (subject) jumpMainPaneToTask(paneId, subject);
       }
     }
     return true;
@@ -2755,6 +2846,7 @@ function taskOverlayDaemon(cwd) {
         lines.push('');
       }
       const rowMap = new Map();
+      const searchable = searchableSubjectsForStatusPane(paneId, ordered.map(t => String(t.subject || '').replace(/\s+/g, ' ').trim()));
       for (let vi = 0; vi < visible.length; vi++) {
         const gi = start + vi;
         const t = visible[vi];
@@ -2762,20 +2854,23 @@ function taskOverlayDaemon(cwd) {
         const sub = String(t.subject || '').replace(/\s+/g, ' ').trim();
         const num = String(gi + 1).padStart(2);
         const text = clipToCells(sub, Math.max(1, w - 6));
+        const canJump = searchable.has(sub);
         const marker = isLast ? (working ? '\x1b[1;33m▸\x1b[0m' : '\x1b[1;32m▸\x1b[0m') : ' ';
-        const numCol = isLast ? '\x1b[1;38;5;39m' : '\x1b[2m';
-        const bodyStyle = isLast ? '\x1b[1m' : '';
+        const numCol = canJump ? (isLast ? '\x1b[1;38;5;39m' : '\x1b[2m') : '\x1b[2;90m';
+        const bodyStyle = canJump ? (isLast ? '\x1b[1m' : '') : '\x1b[2;90m';
         // rowMap keys are 0-based visual rows to match tmux #{mouse_y}
         // (the click coordinate is 0-based; the sidebar clickmap uses the
         // same convention). lines.length here is the 0-based index of the
-        // row about to be pushed.
-        rowMap.set(lines.length, sub);
+        // row about to be pushed. Old commands no longer present in the main
+        // pane transcript are dimmed and intentionally not clickable.
+        if (canJump) rowMap.set(lines.length, sub);
         lines.push(`${marker}${numCol}${num}.\x1b[0m ${bodyStyle}${text}\x1b[0m`);
       }
       if (belowCount > 0) {
         lines.push(`\x1b[2m   ↓ +${belowCount} 최신 (wheel ↓)\x1b[0m`);
       }
       lastSortedRef = { rowMap };
+      writeTaskRowmap(paneId, rowMap, w, process.stdout.rows || 0);
     } else {
       // Two-bucket stack: completed [x] above, todo [ ] below.
       // Within each bucket, oldest at top → newest at bottom. This
@@ -2846,6 +2941,7 @@ function taskOverlayDaemon(cwd) {
         lines.push(`\x1b[2m   ↓ +${belowCount} 최신 (wheel ↓)\x1b[0m`);
       }
       lastSortedRef = { rowMap };
+      writeTaskRowmap(paneId, rowMap, w, process.stdout.rows || 0);
     }
     const body = lines.map(l => l + '\x1b[K').join('\n');
     if (body !== lastBody) {
@@ -2981,7 +3077,7 @@ function gitOverlayDaemon(cwd) {
 // process, and routes to the right project. The watcher inspects the
 // pane itself, so any agent in any window is seen consistently.
 
-const AGENT_BINS = new Set(['claude', 'codex', 'omx', 'gemini', 'aider', 'continue', 'cursor']);
+const AGENT_BINS = new Set(['claude', 'codex', 'omx', 'gemini', 'aider', 'continue', 'cursor', 'gjc', 'gajae', 'opencode']);
 
 function looksLikeAgent(cmdline) {
   const c = String(cmdline || '').replace(/\0/g, ' ').trim();
@@ -3027,6 +3123,66 @@ function readCpuTicks(pid) {
   } catch { return 0; }
 }
 
+// Sum CPU ticks across a pane's entire process subtree. Agent-agnostic:
+// it does not care whether the binary is a "known" agent — any real work
+// (LLM streaming, tool subprocesses, compilers, test runners) burns CPU
+// somewhere under the pane's shell, so the subtree total is a reliable
+// "is this pane actively working" signal for gjc / codex / claude alike.
+function subtreeCpuTicks(rootPid, proc) {
+  if (!rootPid) return 0;
+  let total = 0;
+  const stack = [String(rootPid)];
+  const seen = new Set();
+  while (stack.length) {
+    const p = stack.pop();
+    if (!p || seen.has(p)) continue;
+    seen.add(p);
+    total += readCpuTicks(p);
+    for (const child of proc.children.get(p) || []) stack.push(child);
+  }
+  return total;
+}
+
+function paneTextActivityState(text) {
+  const s = String(text || '');
+  if (!s.trim()) return 'unknown';
+  // GJC can keep the input box visible while a foreground tool or detached
+  // background job is still running. Those markers are stronger than the
+  // stale prompt and must keep the sidebar spinner alive.
+  if (/\bWorking \([^\n]*\)/.test(s)) return 'busy';
+  if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+[^\n]*⟦esc⟧/.test(s)) return 'busy';
+  if (/^\s*┌───\s*⏳\s+/m.test(s)) return 'busy';
+  if (/⚠\s*jobs\b/.test(s)) return 'busy';
+  if (/Type your message\.\.\./.test(s) || /(?:^|\n)\s*[›>]\s*$/.test(s)) return 'idle';
+  return 'unknown';
+}
+
+function paneTextLooksAwaitingInput(text) {
+  return paneTextActivityState(text) === 'idle';
+}
+
+function activityStateFromSignals(textState, hasAgentProcess) {
+  if (textState === 'busy' || textState === 'idle') return textState;
+  return hasAgentProcess ? 'busy' : 'unknown';
+}
+
+function paneActivityState(paneId) {
+  if (!paneId) return 'unknown';
+  const out = tmux(['capture-pane', '-p', '-t', paneId, '-S', '-80'], { allowFail: true });
+  return paneTextActivityState(out);
+}
+
+function paneLooksAwaitingInput(paneId) {
+  return paneActivityState(paneId) === 'idle';
+}
+
+function statusAfterVisit(currentStatus, activityState) {
+  if (activityState === 'busy') return 'running';
+  const cur = String(currentStatus || '').trim();
+  if (cur === 'running' && activityState === 'unknown') return 'running';
+  return 'idle';
+}
+
 const WATCHER_PID_FILE = path.join(CONFIG_DIR, 'watcher.pid');
 
 function watcherIsAlive() {
@@ -3069,8 +3225,8 @@ function watchAgentsDaemon() {
   // process existence alone is not a useful signal, so we sample CPU
   // delta over a TICK_MS window instead.
   const prevQuietTicks = new Map();  // window_id -> consecutive idle ticks
-  const prevCpu = new Map();         // pid -> cumulative ticks
-  const prevPtyMtime = new Map();    // pane_tty -> last seen mtime (ms)
+  const prevCpu = new Map();         // window_id -> main-pane subtree CPU ticks
+  const prevPtyMtime = new Map();    // window_id -> main-pane PTY mtime (ms)
   const TICK_MS = Math.max(2000, Number(process.env.NMUX_WATCHER_TICK_MS || 3000));
   const CPU_ACTIVE_THRESHOLD = 60;   // ~600ms CPU/sample — heavy tool
                                      // execution only. Tuned higher
@@ -3126,40 +3282,26 @@ function watchAgentsDaemon() {
     let out;
     try {
       out = tmux(['list-panes', '-s', '-t', SESSION, '-F',
-        '#{window_id}\t#{window_index}\t#{pane_pid}\t#{pane_tty}\t#{pane_title}'],
+        '#{window_id}\t#{window_index}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_title}'],
         { allowFail: true });
     } catch { return; }
     const proc = readProcIndex();
     const byWin = new Map();
     for (const line of out.split('\n')) {
       if (!line) continue;
-      const [wid, widx, ppid, ptty, title] = line.split('\t');
-      if (title === 'nmux-linux-sidebar') continue;
-      if (!byWin.has(wid)) byWin.set(wid, { idx: widx, ppids: [], ptys: [] });
-      byWin.get(wid).ppids.push(ppid);
-      byWin.get(wid).ptys.push(ptty);
+      const [wid, widx, paneId, ppid, ptty, title] = line.split('\t');
+      // Only the MAIN coding pane drives the status. The sidebar, status
+      // overlay, sub and bash panes either redraw on their own schedule
+      // (which used to register as fake "activity" and pin a row to
+      // "running" forever) or are user scratch shells — none represent the
+      // project's agent doing work. One main pane per window; first wins.
+      if (isReservedPaneTitle(title)) continue;
+      if (!byWin.has(wid)) byWin.set(wid, { idx: widx, paneId, ppid, ptty });
     }
-    // Forget windows that no longer exist.
-    for (const wid of Array.from(prevQuietTicks.keys())) {
-      if (!byWin.has(wid)) prevQuietTicks.delete(wid);
-    }
-    // Forget PTY mtime baselines for vanished panes so stale entries
-    // don't pile up across long-running sessions.
-    const liveTtys = new Set();
-    for (const info of byWin.values()) for (const t of info.ptys) liveTtys.add(t);
-    for (const t of Array.from(prevPtyMtime.keys())) {
-      if (!liveTtys.has(t)) prevPtyMtime.delete(t);
-    }
-    // Garbage-collect prevCpu entries for pids that vanished.
-    const livePids = new Set();
-    for (const [, info] of byWin) {
-      for (const ppid of info.ppids) {
-        for (const apid of findAgentPidsInPane(ppid, proc)) livePids.add(apid);
-      }
-    }
-    for (const pid of Array.from(prevCpu.keys())) {
-      if (!livePids.has(pid)) prevCpu.delete(pid);
-    }
+    // Forget bookkeeping (all keyed by window id now) for vanished windows.
+    for (const wid of Array.from(prevQuietTicks.keys())) if (!byWin.has(wid)) prevQuietTicks.delete(wid);
+    for (const wid of Array.from(prevCpu.keys())) if (!byWin.has(wid)) prevCpu.delete(wid);
+    for (const wid of Array.from(prevPtyMtime.keys())) if (!byWin.has(wid)) prevPtyMtime.delete(wid);
     const now = Date.now();
     for (const [wid, info] of byWin) {
       const target = `${SESSION}:${info.idx}`;
@@ -3170,87 +3312,57 @@ function watchAgentsDaemon() {
       const clickedAtStr = tmux(['show-window-options', '-t', target, '-v',
         '@nmuxlinux_clicked_at'], { allowFail: true }).trim();
       const clickedAt = parseInt(clickedAtStr, 10);
-      if (Number.isFinite(clickedAt) && now - clickedAt < CLICK_GRACE_MS) {
-        for (const ptty of info.ptys) {
-          if (!ptty || ptty === '-') continue;
-          try { prevPtyMtime.set(ptty, fs.statSync(ptty).mtimeMs); } catch {}
-        }
-        // Sample CPU baselines so we have fresh prev values once grace ends.
-        for (const apid of info.ppids.flatMap(pid => findAgentPidsInPane(pid, proc))) {
-          prevCpu.set(apid, readCpuTicks(apid));
-        }
-        continue;
-      }
-      const agents = info.ppids.flatMap(pid => findAgentPidsInPane(pid, proc));
+      const inClickGrace = Number.isFinite(clickedAt) && now - clickedAt < CLICK_GRACE_MS;
+      const PTY_MAX_GAP_MS = 30000;
+
+      // Sample the MAIN pane's two signals: CPU burned across its whole
+      // process subtree, and its PTY mtime (visible output). Both are kept
+      // per-window so the math is identical for every agent.
+      const cpuNow = subtreeCpuTicks(info.ppid, proc);
+      let ptyNow = 0;
+      if (info.ptty && info.ptty !== '-') { try { ptyNow = fs.statSync(info.ptty).mtimeMs; } catch {} }
+      const prevCpuTicks = prevCpu.get(wid);
+      const prevPty = prevPtyMtime.get(wid);
+      prevCpu.set(wid, cpuNow);
+      prevPtyMtime.set(wid, ptyNow);
+
+      // The window the user just selected redraws its whole pane; rebase
+      // the baselines (done above) and skip a decision so that redraw burst
+      // is never read as agent work.
+      if (inClickGrace) { prevQuietTicks.set(wid, 0); continue; }
+
+      const hasAgentProcess = findAgentPidsInPane(info.ppid, proc).length > 0;
+      const activityState = activityStateFromSignals(paneActivityState(info.paneId), hasAgentProcess);
+      const awaitingInput = activityState === 'idle';
+
       let active = false;
       const trigger = [];
-      // (a) CPU delta on any agent process
-      for (const apid of agents) {
-        const cur = readCpuTicks(apid);
-        const prev = prevCpu.get(apid);
-        prevCpu.set(apid, cur);
-        if (prev != null) {
-          const delta = cur - prev;
-          if (delta >= CPU_ACTIVE_THRESHOLD) {
-            active = true;
-            trigger.push(`cpu ${apid}:${delta}`);
-          }
-        }
+      if (activityState === 'busy') {
+        active = true; trigger.push('screen:busy');
       }
-      // (b) PTY mtime advanced this tick — agent producing output.
-      // Single-tick bump now counts (we removed the two-in-a-row rule
-      // because LLM streams often have 1-tick stream / 1-tick pause /
-      // 1-tick stream patterns that the old rule misread as idle).
-      // The click-grace branch above absorbs the one-off PTY burst
-      // caused by tmux redrawing a freshly-selected pane, so a bare
-      // user click no longer false-triggers here.
-      if (agents.length) {
-        const PTY_MAX_GAP_MS = 30000;
-        for (const ptty of info.ptys) {
-          if (!ptty || ptty === '-') continue;
-          let mt = 0;
-          try { mt = fs.statSync(ptty).mtimeMs; } catch { continue; }
-          const prev = prevPtyMtime.get(ptty);
-          prevPtyMtime.set(ptty, mt);
-          if (prev != null && mt > prev) {
-            const gap = mt - prev;
-            // Real LLM streams / live tool output bump PTY mtime every
-            // tick or two (sub-second cadence). Gaps over PTY_MAX_GAP_MS
-            // (30s) almost always come from one-off background
-            // chatter — token-usage poll, mcp heartbeat, status-bar
-            // refresh — not user-visible agent work. Treat them as
-            // idle so the sidebar doesn't flip-flop every few minutes.
-            if (gap < PTY_MAX_GAP_MS) {
-              active = true;
-              trigger.push(`pty ${ptty}:+${Math.round(gap)}ms`);
-            }
-          }
-        }
+      if (!active && !awaitingInput && prevCpuTicks != null && cpuNow - prevCpuTicks >= CPU_ACTIVE_THRESHOLD) {
+        active = true; trigger.push(`cpu:+${cpuNow - prevCpuTicks}`);
       }
+      if (!awaitingInput && !active && prevPty != null && ptyNow > prevPty && (ptyNow - prevPty) < PTY_MAX_GAP_MS) {
+        active = true; trigger.push(`pty:+${Math.round(ptyNow - prevPty)}ms`);
+      }
+
       const curStatus = tmux(['show-window-options', '-t', target, '-v', '@nmuxlinux_status'],
         { allowFail: true }).trim();
-      const prevQuiet = prevQuietTicks.get(wid) ?? 0;
       if (active) {
         prevQuietTicks.set(wid, 0);
-        if (curStatus === 'idle' || curStatus === 'done' || curStatus === '') {
-          setWindowStatus(target, 'running', undefined, { allowFail: true });
-          wlog(`w=${info.idx} idle→running agents=${agents.length} trigger=${trigger.join('|')}`);
-        } else if (curStatus === 'running') {
-          // Keep live running statuses fresh. Sidebars intentionally hide
-          // old/unstamped running options so a crashed watcher or legacy
-          // tmux option cannot animate forever.
-          setWindowStatus(target, 'running', undefined, { allowFail: true });
-        }
+        // One rule for every agent: active main pane → spinner, regardless
+        // of the prior state (idle / done / need-input / failed / blank).
+        if (curStatus !== 'running') wlog(`w=${info.idx} ${curStatus || '∅'}→running ${trigger.join('|')}`);
+        setWindowStatus(target, 'running', undefined, { allowFail: true });
       } else {
-        const nq = prevQuiet + 1;
+        const nq = (prevQuietTicks.get(wid) ?? 0) + 1;
         prevQuietTicks.set(wid, nq);
-        // Only drop running→done after N consecutive idle ticks. This
-        // is hysteresis: a single quiet tick between LLM token bursts
-        // no longer flickers the indicator. Other states (need-input,
-        // failed) are never overwritten by the watcher.
+        // running→done only after N consecutive idle ticks (hysteresis: a
+        // brief think-pause between output bursts must not flip to ✓).
         if (curStatus === 'running' && nq >= QUIET_TICKS_TO_DONE) {
           setWindowStatus(target, 'done', undefined, { allowFail: true });
-          wlog(`w=${info.idx} running→done (quiet ${nq} ticks)`);
+          wlog(`w=${info.idx} running→done (quiet ${nq})`);
         }
       }
     }
@@ -3412,31 +3524,17 @@ function clearStatus(project) {
 
 function clearStatusTarget(target) {
   if (!target) return;
-  // Preserve "running" across a window-visit. The after-select-window
-  // hook fires clear-status on every visit, which is right for the
-  // "I saw the ✓ / ✕ / ?" terminal states — the user has acknowledged
-  // them, drop the indicator. But for "running" the spinner is the
-  // user's live signal that work is still in flight. Only fresh running
-  // statuses are preserved; old/unstamped ones are stale and were the
-  // source of permanent spinners and fast sidebar repainting.
+  // A window visit acknowledges only a settled indicator (✓ done / ✕ failed /
+  // ? need-input). It must never cancel real in-flight work. GJC can show an
+  // input box while background jobs/tools are still running, so consult the
+  // main pane screen before clearing anything.
+  const mainPane = findMainPaneInWindow(target);
+  const activityState = mainPane ? paneActivityState(mainPane) : 'unknown';
   const cur = tmux(['show-window-options', '-t', target, '-v', '@nmuxlinux_status'],
     { allowFail: true }).trim();
-  if (cur === 'running' && runningStatusIsFresh(target) && targetHasAgentProcess(target)) return;
-  setWindowStatus(target, 'idle', '', { allowFail: true });
-}
-
-function targetHasAgentProcess(target) {
-  const panes = tmux(['list-panes', '-t', target, '-F', '#{pane_pid}\t#{pane_title}'],
-    { allowFail: true });
-  if (!panes) return false;
-  const proc = readProcIndex();
-  for (const line of panes.split('\n')) {
-    if (!line) continue;
-    const [rootPid, title] = line.split('\t');
-    if (paneRoleOf(title) === 'sidebar') continue;
-    if (findAgentPidsInPane(rootPid, proc).length) return true;
-  }
-  return false;
+  const next = statusAfterVisit(cur, activityState);
+  if (next === cur) return;
+  setWindowStatus(target, next, next === 'idle' ? '' : undefined, { allowFail: true });
 }
 
 function currentNmuxWindowTarget() {
@@ -3610,6 +3708,34 @@ function addProject(name, dir) {
   saveConfig(cfg);
   console.log(`added: ${name} -> ${abs}`);
 }
+function refreshProjectDisplay(project) {
+  if (!project || !sessionExists(SESSION)) return;
+  const out = tmux(['list-windows', '-t', SESSION, '-F', '#{@nmuxlinux_project}\t#{window_index}'], { allowFail: true });
+  for (const line of out.split('\n')) {
+    if (!line) continue;
+    const [name, idx] = line.split('\t');
+    if (name !== project.name) continue;
+    const target = `${SESSION}:${idx}`;
+    tmux(['set-window-option', '-t', target, '@nmuxlinux_project_display', projectDisplayName(project)], { allowFail: true });
+    tmux(['set-window-option', '-t', target, '@nmuxlinux_project_folder', projectFolderName(project)], { allowFail: true });
+    tmux(['rename-window', '-t', target, projectWindowName(project)], { allowFail: true });
+  }
+}
+
+function labelProject(key, labelParts = []) {
+  if (!key) throw new Error('usage: nmux-linux label <project> [name]');
+  const cfg = loadConfig() || initConfig();
+  const project = findProjectByKey(cfg, key);
+  if (!project) throw new Error(`not found: ${key}`);
+  const label = Array.isArray(labelParts) ? labelParts.join(' ').trim() : String(labelParts || '').trim();
+  if (label) project.displayName = label;
+  else delete project.displayName;
+  saveConfig(cfg);
+  refreshProjectDisplay(project);
+  nudgeSidebars();
+  console.log(label ? `labeled: ${project.name} -> ${label} (${project.cwd})` : `label cleared: ${project.name} (${project.cwd})`);
+}
+
 function rmProject(name) {
   let cfg = loadConfig();
   if (!cfg) throw new Error('no config');
@@ -3665,7 +3791,10 @@ function main() {
     // Args: <mouse_y> <pane_id>
     const y = parseInt(args._[1], 10);
     const pid = args._[2];
-    if (Number.isFinite(y) && pid) appendTaskEvent(pid, `CLICK ${y}`);
+    if (Number.isFinite(y) && pid) {
+      const subject = readTaskClickSubject(pid, y);
+      appendTaskEvent(pid, subject ? `JUMP ${subject}` : `CLICK ${y}`);
+    }
     return;
   }
   if (cmd === 'mouseup') {
@@ -3692,7 +3821,8 @@ function main() {
         return;
       }
       if (role === 'status') {
-        if (Number.isFinite(y)) appendTaskEvent(pid, `CLICK ${y}`);
+        const subject = Number.isFinite(y) ? readTaskClickSubject(pid, y) : '';
+        appendTaskEvent(pid, subject ? `JUMP ${subject}` : `CLICK ${y}`);
         return;
       }
     }
@@ -3764,6 +3894,7 @@ function main() {
   if (cmd === 'notify')    { const r = notify({ project: args.project, status: args.status, message: args.message, session: args.session }); console.log(`${r.project}: ${r.status}`); return; }
   if (cmd === 'notify-current') { const r = notifyCurrent({ status: args.status, message: args.message, session: args.session, project: args.project }); console.log(`${r.project}: ${r.status}`); return; }
   if (cmd === 'clear-status') { clearStatus(args.project); return; }
+  if (cmd === 'label')    { labelProject(args._[1], args._.slice(2)); return; }
   if (cmd === 'add')       { addProject(args._[1], args._[2]); return; }
   if (cmd === 'rm')        { rmProject(args._[1]); return; }
   console.error('Unknown command: ' + cmd);
@@ -3790,5 +3921,17 @@ if (require.main === module) {
     parseGjcUserMessages,
     listGjcSessionFiles,
     readGjcSource,
+    paneTextLooksAwaitingInput,
+    paneTextActivityState,
+    activityStateFromSignals,
+    statusAfterVisit,
+    readTaskClickSubject,
+    taskSearchSnippet,
+    searchableSubjectsFromText,
+    projectDisplayName,
+    projectFolderName,
+    projectDisplayTitle,
+    findProjectByKey,
+    writeTaskRowmap,
   };
 }

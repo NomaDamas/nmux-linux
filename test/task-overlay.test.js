@@ -125,3 +125,125 @@ test('graphics-blob title resolves to main pane, not a reserved role', () => {
   assert.equal(overlay.paneRoleOf('nmux-linux-sidebar'), 'sidebar');
   assert.equal(overlay.paneRoleOf('proj-status'), 'status');
 });
+
+test('agent prompt detection treats idle input box as not running', () => {
+  const pane = `
+ gajae
+ 작업 완료.
+
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘`;
+  assert.equal(overlay.paneTextLooksAwaitingInput(pane), true);
+});
+
+test('agent prompt detection ignores stale prompt while work is active', () => {
+  const pane = `
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘
+
+• Working (4m 27s • esc to interrupt)`;
+  assert.equal(overlay.paneTextLooksAwaitingInput(pane), false);
+});
+
+test('agent prompt detection ignores prompt while a tool is running', () => {
+  const pane = `
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘
+
+ ⠇ Read ModuDoc tree ⟦esc⟧`;
+  assert.equal(overlay.paneTextLooksAwaitingInput(pane), false);
+});
+
+test('agent activity state treats GJC background jobs marker as busy', () => {
+  const pane = `
+ ✔ Todo Write 9 tasks
+ ⬢ gpt-5.5 via Nomadamas proxy · ◒ med / 📁 ~/projects/private ─ ⚠ jobs / ⤴ 22.4/s
+
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘`;
+  assert.equal(overlay.paneTextActivityState(pane), 'busy');
+  assert.equal(overlay.paneTextLooksAwaitingInput(pane), false);
+});
+
+test('agent activity state treats pending spinner command as busy', () => {
+  const pane = `
+ ┌─── ⏳ Bash ─────────────────────────────────────────────────┐
+ │ $ long running benchmark                                    │
+ └─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘`;
+  assert.equal(overlay.paneTextActivityState(pane), 'busy');
+});
+
+test('agent activity state ignores stale timed-out command transcript', () => {
+  const pane = `
+ gajae
+ 완료했습니다.
+
+ ⏳ Bash: $ old command from previous transcript
+
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘`;
+  assert.equal(overlay.paneTextActivityState(pane), 'idle');
+});
+
+test('hidden live agent process keeps unknown screen busy', () => {
+  assert.equal(overlay.activityStateFromSignals('unknown', true), 'busy');
+  assert.equal(overlay.activityStateFromSignals('unknown', false), 'unknown');
+});
+
+test('visible idle prompt overrides live agent process', () => {
+  assert.equal(overlay.activityStateFromSignals('idle', true), 'idle');
+});
+
+test('window visit keeps running while GJC work is still busy', () => {
+  assert.equal(overlay.statusAfterVisit('done', 'busy'), 'running');
+  assert.equal(overlay.statusAfterVisit('idle', 'busy'), 'running');
+  assert.equal(overlay.statusAfterVisit('running', 'idle'), 'idle');
+});
+
+test('window visit clears only settled non-running indicators', () => {
+  assert.equal(overlay.statusAfterVisit('done', 'idle'), 'idle');
+  assert.equal(overlay.statusAfterVisit('failed', 'idle'), 'idle');
+  assert.equal(overlay.statusAfterVisit('need-input', 'idle'), 'idle');
+});
+
+test('status rowmap survives separate click handler process lookup', () => {
+  const paneId = `%test-${process.pid}`;
+  const rowMap = new Map([[7, 'clicked command'], [8, 'next command']]);
+  overlay.writeTaskRowmap(paneId, rowMap, 48, 24);
+  assert.equal(overlay.readTaskClickSubject(paneId, 7), 'clicked command');
+  assert.equal(overlay.readTaskClickSubject(paneId, 9), '');
+});
+
+test('searchableSubjectsFromText marks only commands still in main transcript', () => {
+  const subjects = ['recent command to jump', 'old command lost from context'];
+  const ok = overlay.searchableSubjectsFromText(subjects, 'assistant output recent command to jump done');
+  assert.equal(ok.has('recent command to jump'), true);
+  assert.equal(ok.has('old command lost from context'), false);
+});
+
+test('taskSearchSnippet uses normalized leading search text', () => {
+  assert.equal(overlay.taskSearchSnippet('  abc   def  '.repeat(5)), 'abc def abc def abc def abc def abc def');
+});
+
+test('project display helpers keep cwd stable while showing friendly label and folder', () => {
+  const project = { name: 'stable_key', displayName: 'Friendly Name', cwd: '/tmp/actual-folder' };
+  assert.equal(overlay.projectDisplayName(project), 'Friendly Name');
+  assert.equal(overlay.projectFolderName(project), 'actual-folder');
+  assert.equal(overlay.projectDisplayTitle(project), 'Friendly Name · actual-folder');
+});
+
+test('findProjectByKey resolves stable name, display label, and cwd', () => {
+  const cfg = { projects: [{ name: 'stable_key', displayName: 'Friendly Name', cwd: '/tmp/actual-folder' }] };
+  assert.equal(overlay.findProjectByKey(cfg, 'stable_key').name, 'stable_key');
+  assert.equal(overlay.findProjectByKey(cfg, 'Friendly Name').name, 'stable_key');
+  assert.equal(overlay.findProjectByKey(cfg, '/tmp/actual-folder').name, 'stable_key');
+});

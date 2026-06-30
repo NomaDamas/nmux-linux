@@ -161,6 +161,24 @@ function loadRegistry() {
   catch { return []; }
 }
 
+function projectDisplayName(project) {
+  return String(project && (project.displayName || project.name) || '').trim();
+}
+
+function projectFolderName(project) {
+  return path.basename(String(project && project.cwd || '')) || projectDisplayName(project);
+}
+
+function projectDisplayTitle(project) {
+  const label = projectDisplayName(project);
+  const folder = projectFolderName(project);
+  return label && folder && label !== folder ? `${label} · ${folder}` : (label || folder);
+}
+
+function registryByName(registry) {
+  return new Map((registry || []).map(p => [p.name, p]));
+}
+
 function scanSubfolders() {
   const found = []; const seen = new Set();
   for (const root of SCAN_ROOTS) {
@@ -238,6 +256,7 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
   // click targets.
   const lineW = Math.max(1, w - 1);
   const rowTextW = Math.max(1, w - 3);
+  const byName = registryByName(registry);
   const openNames = new Set(rows.map(r => (r.p || r.n).replace(/^[✓✕?…! ]+\s*/, '')));
   const closed = registry.filter(p => !openNames.has(p.name));
   const registryNames = new Set(registry.map(p => p.name));
@@ -257,6 +276,7 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
   // -------- open windows --------
   for (const r of rows) {
     const name = (r.p || r.n).replace(/^[✓✕?…! ]+\s*/, '');
+    const display = projectDisplayTitle(byName.get(name)) || name;
     const style = rowStyle(r.s, r.a);
     const arrow = r.a ? '▸' : ' ';
     const idxs = String(r.i).padStart(2);
@@ -265,13 +285,13 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
       // Whole-row colored block — name + status + close button all on the
       // background color. Stays loud until the user visits the window
       // (after-select-window → nmux-linux clear-status resets it).
-      const inner = `${arrow}${idxs} ${ic} ${name}`;
+      const inner = `${arrow}${idxs} ${ic} ${display}`;
       const padded = pad(inner, rowTextW);
       // Render close × in the same row block but with explicit fg/bg
       // so it stays readable on the colored background.
       lines.push(style.open + padded + ' ×' + style.close);
     } else {
-      const left = `${style.open}${arrow}${idxs} ${ic} ${name}${style.close}`;
+      const left = `${style.open}${arrow}${idxs} ${ic} ${display}${style.close}`;
       const padded = pad(left, rowTextW);
       const closeMark = r.a ? ' \x1b[1;31m×\x1b[0m' : ' \x1b[2;31m×\x1b[0m';
       lines.push(padded + closeMark);
@@ -294,7 +314,7 @@ function buildSidebarFrame({ rows, registry, discover, width, frame = __frame })
     row++;
     // limit to first 12 to avoid overwhelming sidebar
     for (const p of closed.slice(0, 20)) {
-      lines.push(pad(`\x1b[37m   ${p.name}\x1b[0m`, w - 1));
+      lines.push(pad(`\x1b[37m   ${projectDisplayTitle(p)}\x1b[0m`, w - 1));
       map.push(`${row}\treopen\t${p.name}\t0`);
       row++;
     }
@@ -565,6 +585,9 @@ else module.exports = {
   pad,
   parseRows,
   responsiveSidebarWidth,
+  projectDisplayName,
+  projectFolderName,
+  projectDisplayTitle,
   RUNNING_STALE_MS,
   SPINNER,
   terminalFrame,

@@ -46,6 +46,23 @@ test('buildSidebarFrame is deterministic and keeps clickmap stable across spinne
   assert.match(a.body, /\x1b\[K/, 'frame body should clear to end of line');
 });
 
+test('buildSidebarFrame renders display labels while clickmap keeps stable project keys', () => {
+  const out = sidebar.buildSidebarFrame({
+    rows: [{ i: '1', n: 'stable-key', a: true, s: 'idle', p: 'stable-key', m: '' }],
+    registry: [
+      { name: 'stable-key', displayName: 'Friendly Name', cwd: '/tmp/actual-folder' },
+      { name: 'closed-key', displayName: 'Closed Label', cwd: '/tmp/closed-folder' },
+    ],
+    discover: [],
+    width: 40,
+  });
+  const body = stripAnsi(out.body);
+  assert.match(body, /Friendly Name · actual-folder/);
+  assert.match(body, /Closed Label · closed-folder/);
+  assert.match(out.clickmap, /^2\tswitch\t1\t0/m);
+  assert.match(out.clickmap, /^5\treopen\tclosed-key\t0/m);
+});
+
 test('spinner-only repaint changes exactly one rendered line (no footer flicker)', () => {
   const input = {
     rows: [{ i: '1', n: 'proj-a', a: true, s: 'running', p: 'proj-a', m: '' }],
