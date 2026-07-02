@@ -1937,6 +1937,11 @@ const _codexRolloutCache = new Map(); // path → { size, plan, plannedAt }
 
 const _codexCandidateCache = { at: 0, candidates: [] };
 const CODEX_CANDIDATE_SCAN_TTL_MS = 30000;
+const CODEX_HISTORY_PATH = path.join(HOME, '.codex', 'history.jsonl');
+const _codexHistoryCache = { size: -1, msgsBySession: new Map() };
+const _codexRolloutByIdCache = { at: 0, map: new Map() };
+
+
 
 function codexDateDirParts(d) {
   const y = String(d.getFullYear()).padStart(4, '0');
@@ -1982,11 +1987,22 @@ function codexFirstLineCwd(filePath) {
   try {
     const fd = fs.openSync(filePath, 'r');
     try {
-      const buf = Buffer.alloc(8192);
-      const n = fs.readSync(fd, buf, 0, buf.length, 0);
-      const head = buf.slice(0, n).toString('utf8');
-      const nl = head.indexOf('\n');
-      const line = nl === -1 ? head : head.slice(0, nl);
+      const chunks = [];
+      let pos = 0;
+      while (pos < 1024 * 1024) {
+        const buf = Buffer.alloc(8192);
+        const n = fs.readSync(fd, buf, 0, buf.length, pos);
+        if (n <= 0) break;
+        const slice = buf.slice(0, n);
+        const nl = slice.indexOf(10);
+        if (nl !== -1) {
+          chunks.push(slice.slice(0, nl));
+          break;
+        }
+        chunks.push(slice);
+        pos += n;
+      }
+      const line = Buffer.concat(chunks).toString('utf8');
       const j = JSON.parse(line);
       return j?.payload?.cwd || null;
     } finally { fs.closeSync(fd); }
@@ -2049,6 +2065,109 @@ function parseCodexPlan(filePath, stat) {
   _codexRolloutCache.set(filePath, entry);
   return entry;
 }
+function codexSessionIdFromRollout(filePath) {
+  const base = path.basename(filePath).replace(/^rollout-/, '').replace(/\.jsonl$/, '');
+  const m = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(base);
+  return m ? m[1] : '';
+}
+
+function codexRolloutById(now = Date.now()) {
+  if (now - _codexRolloutByIdCache.at < CODEX_CANDIDATE_SCAN_TTL_MS) {
+    return _codexRolloutByIdCache.map;
+  }
+  const map = new Map();
+  for (const y of safeReaddir(CODEX_SESSIONS_DIR)) {
+    const yDir = path.join(CODEX_SESSIONS_DIR, y);
+    for (const m of safeReaddir(yDir)) {
+      const mDir = path.join(yDir, m);
+      for (const d of safeReaddir(mDir)) {
+        const dDir = path.join(mDir, d);
+        for (const f of safeReaddir(dDir)) {
+          if (!/^rollout-.+\.jsonl$/.test(f)) continue;
+          const id = codexSessionIdFromRollout(f);
+          if (id) map.set(id, path.join(dDir, f));
+        }
+      }
+    }
+  }
+  _codexRolloutByIdCache.at = now;
+  _codexRolloutByIdCache.map = map;
+  return map;
+}
+
+function codexSessionIdsForCwd(cwd, now = Date.now()) {
+  const ids = new Set();
+  for (const c of recentCodexRolloutCandidates(now)) {
+    let rcwd = _codexCwdCache.get(c.path);
+    if (rcwd === undefined) {
+      rcwd = codexFirstLineCwd(c.path);
+      _codexCwdCache.set(c.path, rcwd);
+    }
+    if (rcwd === cwd) {
+      const id = codexSessionIdFromRollout(c.path);
+      if (id) ids.add(id);
+    }
+  }
+  const bySession = parseCodexHistory();
+  const rolloutById = codexRolloutById(now);
+  for (const id of bySession.keys()) {
+    if (ids.has(id)) continue;
+    const fp = rolloutById.get(id);
+    if (!fp) continue;
+    let rcwd = _codexCwdCache.get(fp);
+    if (rcwd === undefined) {
+      rcwd = codexFirstLineCwd(fp);
+      _codexCwdCache.set(fp, rcwd);
+    }
+    if (rcwd === cwd) ids.add(id);
+  }
+  return ids;
+}
+
+function parseCodexHistory() {
+  const st = safeStat(CODEX_HISTORY_PATH);
+  if (!st || !st.isFile()) return new Map();
+  if (_codexHistoryCache.size === st.size) return _codexHistoryCache.msgsBySession;
+  const msgsBySession = new Map();
+  let text;
+  try { text = fs.readFileSync(CODEX_HISTORY_PATH, 'utf8'); } catch { return new Map(); }
+  for (const line of text.split('\n')) {
+    if (!line) continue;
+    let o;
+    try { o = JSON.parse(line); } catch { continue; }
+    const sid = String(o.session_id || '').trim();
+    const body = String(o.text || '').replace(/\s+/g, ' ').trim();
+    if (!sid || !body || body.startsWith('<')) continue;
+    if (!msgsBySession.has(sid)) msgsBySession.set(sid, []);
+    msgsBySession.get(sid).push({ subject: body, status: 'message', ts: Number(o.ts) || 0 });
+  }
+  _codexHistoryCache.size = st.size;
+  _codexHistoryCache.msgsBySession = msgsBySession;
+  return msgsBySession;
+}
+
+function readCodexHistorySource(cwd) {
+  if (!cwd) return null;
+  const ids = codexSessionIdsForCwd(cwd);
+  if (!ids.size) return null;
+  const bySession = parseCodexHistory();
+  const merged = [];
+  const seen = new Set();
+  for (const id of ids) {
+    for (const m of bySession.get(id) || []) {
+      const key = `${m.ts}\u0000${m.subject}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push({ ...m });
+    }
+  }
+  if (!merged.length) return null;
+  merged.sort((a, b) => a.ts - b.ts);
+  merged.forEach((m, i) => { m.order = i; });
+  const st = safeStat(CODEX_HISTORY_PATH);
+  return { source: `codex · ${path.basename(cwd) || 'project'}`, tasks: merged, mtime: st ? st.mtimeMs : Date.now(), kind: 'messages' };
+}
+
 
 function readCodexSource(cwd, excl) {
   if (!cwd) return null;
@@ -2367,6 +2486,8 @@ function pickActiveTaskSource(cwd, excl) {
   // over the task-list sources from other agents.
   const gjc = readGjcSource(cwd, excl);
   if (gjc && gjc.tasks && gjc.tasks.length) return gjc;
+  const codexHistory = readCodexHistorySource(cwd);
+  if (codexHistory && codexHistory.tasks && codexHistory.tasks.length) return codexHistory;
   const probes = [
     readClaudeSource(cwd, excl),
     readCodexSource(cwd, excl),
@@ -3146,16 +3267,30 @@ function subtreeCpuTicks(rootPid, proc) {
 function paneTextActivityState(text) {
   const s = String(text || '');
   if (!s.trim()) return 'unknown';
-  // GJC can keep the input box visible while a foreground tool or detached
-  // background job is still running. Those markers are stronger than the
-  // stale prompt and must keep the sidebar spinner alive.
-  if (/\bWorking \([^\n]*\)/.test(s)) return 'busy';
-  if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+[^\n]*⟦esc⟧/.test(s)) return 'busy';
-  if (/^\s*┌───\s*⏳\s+/m.test(s)) return 'busy';
-  if (/⚠\s*jobs\b/.test(s)) return 'busy';
+  // Concrete timed work is strong evidence. Plain spinner/job/tool-box footer
+  // lines remain in the visible transcript after completion, so an actual
+  // input prompt must override those weaker stale markers.
+  if (/\bWorking \((?!\.\.\.\))[^\n]*\)/.test(s)) return 'busy';
   if (/Type your message\.\.\./.test(s) || /(?:^|\n)\s*[›>]\s*$/.test(s)) return 'idle';
+  if (/^\s*┌───\s*⏳\s+/m.test(s)) return 'busy';
+  if (/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+[^\n]*⟦esc⟧/.test(s)) return 'busy';
+  if (/\bWorking \([^\n]*\)/.test(s)) return 'busy';
+  if (/⚠\s*jobs\b/.test(s)) return 'busy';
   return 'unknown';
 }
+
+function paneTextHasSoftBusyMarker(text) {
+  const s = String(text || '');
+  return /\bWorking \([^\n]*\)/.test(s)
+    || /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+[^\n]*⟦esc⟧/.test(s)
+    || /⚠\s*jobs\b/.test(s);
+}
+
+function capturePaneActivityText(paneId) {
+  if (!paneId) return '';
+  return tmux(['capture-pane', '-p', '-t', paneId, '-S', '-80'], { allowFail: true });
+}
+
 
 function paneTextLooksAwaitingInput(text) {
   return paneTextActivityState(text) === 'idle';
@@ -3167,9 +3302,15 @@ function activityStateFromSignals(textState, hasAgentProcess) {
 }
 
 function paneActivityState(paneId) {
-  if (!paneId) return 'unknown';
-  const out = tmux(['capture-pane', '-p', '-t', paneId, '-S', '-80'], { allowFail: true });
-  return paneTextActivityState(out);
+  return paneTextActivityState(capturePaneActivityText(paneId));
+}
+
+function watcherStatusAfterTick(currentStatus, active, awaitingInput, quietTicks, quietLimit) {
+  const cur = String(currentStatus || '').trim();
+  if (active) return 'running';
+  if (cur === 'running' && awaitingInput) return 'done';
+  if (cur === 'running' && quietTicks >= quietLimit) return 'done';
+  return cur;
 }
 
 function paneLooksAwaitingInput(paneId) {
@@ -3332,7 +3473,10 @@ function watchAgentsDaemon() {
       if (inClickGrace) { prevQuietTicks.set(wid, 0); continue; }
 
       const hasAgentProcess = findAgentPidsInPane(info.ppid, proc).length > 0;
-      const activityState = activityStateFromSignals(paneActivityState(info.paneId), hasAgentProcess);
+      const paneText = capturePaneActivityText(info.paneId);
+      const textState = paneTextActivityState(paneText);
+      const softBusyMarker = paneTextHasSoftBusyMarker(paneText);
+      const activityState = activityStateFromSignals(textState, hasAgentProcess);
       const awaitingInput = activityState === 'idle';
 
       let active = false;
@@ -3349,21 +3493,19 @@ function watchAgentsDaemon() {
 
       const curStatus = tmux(['show-window-options', '-t', target, '-v', '@nmuxlinux_status'],
         { allowFail: true }).trim();
-      if (active) {
-        prevQuietTicks.set(wid, 0);
-        // One rule for every agent: active main pane → spinner, regardless
-        // of the prior state (idle / done / need-input / failed / blank).
-        if (curStatus !== 'running') wlog(`w=${info.idx} ${curStatus || '∅'}→running ${trigger.join('|')}`);
+      if (active) prevQuietTicks.set(wid, 0);
+      else prevQuietTicks.set(wid, (prevQuietTicks.get(wid) ?? 0) + 1);
+      const nq = prevQuietTicks.get(wid) ?? 0;
+      const nextStatus = watcherStatusAfterTick(curStatus, active, awaitingInput, nq, QUIET_TICKS_TO_DONE);
+      if (nextStatus !== curStatus) {
+        wlog(`w=${info.idx} ${curStatus || '∅'}→${nextStatus} ${active ? trigger.join('|') : awaitingInput ? 'awaiting-input' : `quiet ${nq}`}`);
+        setWindowStatus(target, nextStatus, undefined, { allowFail: true });
+      } else if (active && curStatus === 'running') {
+        // Keep @nmuxlinux_status_at fresh while work remains active. The
+        // sidebar intentionally suppresses stale running values; without this
+        // refresh, long-running agents disappear after RUNNING_STALE_MS even
+        // though the watcher still sees active work.
         setWindowStatus(target, 'running', undefined, { allowFail: true });
-      } else {
-        const nq = (prevQuietTicks.get(wid) ?? 0) + 1;
-        prevQuietTicks.set(wid, nq);
-        // running→done only after N consecutive idle ticks (hysteresis: a
-        // brief think-pause between output bursts must not flip to ✓).
-        if (curStatus === 'running' && nq >= QUIET_TICKS_TO_DONE) {
-          setWindowStatus(target, 'done', undefined, { allowFail: true });
-          wlog(`w=${info.idx} running→done (quiet ${nq})`);
-        }
       }
     }
   }
@@ -3893,7 +4035,7 @@ function main() {
   if (cmd === 'save-state'){ captureAndSaveOpen(SESSION); console.log('state saved'); return; }
   if (cmd === 'notify')    { const r = notify({ project: args.project, status: args.status, message: args.message, session: args.session }); console.log(`${r.project}: ${r.status}`); return; }
   if (cmd === 'notify-current') { const r = notifyCurrent({ status: args.status, message: args.message, session: args.session, project: args.project }); console.log(`${r.project}: ${r.status}`); return; }
-  if (cmd === 'clear-status') { clearStatus(args.project); return; }
+  if (cmd === 'clear-status') { clearStatus(args.project || args._[1]); return; }
   if (cmd === 'label')    { labelProject(args._[1], args._.slice(2)); return; }
   if (cmd === 'add')       { addProject(args._[1], args._[2]); return; }
   if (cmd === 'rm')        { rmProject(args._[1]); return; }
@@ -3923,11 +4065,19 @@ if (require.main === module) {
     readGjcSource,
     paneTextLooksAwaitingInput,
     paneTextActivityState,
+    paneTextHasSoftBusyMarker,
     activityStateFromSignals,
+    watcherStatusAfterTick,
     statusAfterVisit,
     readTaskClickSubject,
     taskSearchSnippet,
     searchableSubjectsFromText,
+    codexSessionIdFromRollout,
+    codexFirstLineCwd,
+    parseCodexHistory,
+    codexRolloutById,
+    codexSessionIdsForCwd,
+    readCodexHistorySource,
     projectDisplayName,
     projectFolderName,
     projectDisplayTitle,

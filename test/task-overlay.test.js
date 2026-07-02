@@ -24,6 +24,19 @@ test('parseGjcUserMessages extracts only user-typed messages, trimmed and ordere
   assert.ok(msgs.every(m => m.status === 'message'));
 });
 
+test('codexSessionIdFromRollout extracts rollout uuid', () => {
+  const fp = '/home/me/.codex/sessions/2026/06/23/rollout-2026-06-23T04-38-53-019ef0d7-c4f3-7e73-a139-21e62f375975.jsonl';
+  assert.equal(overlay.codexSessionIdFromRollout(fp), '019ef0d7-c4f3-7e73-a139-21e62f375975');
+});
+
+test('codexFirstLineCwd reads long session_meta lines', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-rollout-'));
+  const fp = path.join(dir, 'rollout-2026-06-23T04-38-53-019ef0d7-c4f3-7e73-a139-21e62f375975.jsonl');
+  const meta = { type: 'session_meta', payload: { cwd: '/tmp/crazy_glm', base_instructions: { text: 'x'.repeat(20000) } } };
+  fs.writeFileSync(fp, JSON.stringify(meta) + '\n' + JSON.stringify({ type: 'event_msg' }) + '\n');
+  assert.equal(overlay.codexFirstLineCwd(fp), '/tmp/crazy_glm');
+});
+
 test('clipToCells truncates by terminal display width, not code-unit length', () => {
   // 10 Korean syllables = 20 cells. Fits within 24, must not be clipped.
   assert.equal(overlay.clipToCells('가나다라마바사아자차', 24), '가나다라마바사아자차');
@@ -147,37 +160,65 @@ test('agent prompt detection ignores stale prompt while work is active', () => {
   assert.equal(overlay.paneTextLooksAwaitingInput(pane), false);
 });
 
-test('agent prompt detection ignores prompt while a tool is running', () => {
+test('agent activity state treats spinner transcript plus input prompt as idle', () => {
   const pane = `
 ┌─────────────────────────────────────────────────────────────┐
 │ > Type your message...                                      │
 └─────────────────────────────────────────────────────────────┘
 
  ⠇ Read ModuDoc tree ⟦esc⟧`;
-  assert.equal(overlay.paneTextLooksAwaitingInput(pane), false);
+  assert.equal(overlay.paneTextActivityState(pane), 'idle');
+  assert.equal(overlay.paneTextLooksAwaitingInput(pane), true);
 });
 
-test('agent activity state treats GJC background jobs marker as busy', () => {
+test('agent activity state treats jobs marker without input box as busy', () => {
   const pane = `
- ✔ Todo Write 9 tasks
- ⬢ gpt-5.5 via Nomadamas proxy · ◒ med / 📁 ~/projects/private ─ ⚠ jobs / ⤴ 22.4/s
-
-┌─────────────────────────────────────────────────────────────┐
-│ > Type your message...                                      │
-└─────────────────────────────────────────────────────────────┘`;
+✔ Background job completed [bash] bg_1 (1.8s)
+⬢ gpt-5.5 via Nomadamas proxy · ◒ med / 📁 ~/projects/private ─ ⚠ jobs / ⤴ 22.4/s`;
   assert.equal(overlay.paneTextActivityState(pane), 'busy');
   assert.equal(overlay.paneTextLooksAwaitingInput(pane), false);
 });
 
-test('agent activity state treats pending spinner command as busy', () => {
+test('agent activity state treats stale jobs marker plus input box as idle', () => {
+  const pane = `
+추가로 PDF 변환이나 다른 위치 복사가 필요하시면 말씀해 주세요.
+
+⬢ Opus 4.8 via Nomadamas · ◒ med / 📁 ~/projects/private ─ ⚠ jobs / ⤴ 27.9/s
+
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘`;
+  assert.equal(overlay.paneTextActivityState(pane), 'idle');
+  assert.equal(overlay.paneTextLooksAwaitingInput(pane), true);
+});
+
+test('agent activity state treats stale working marker plus input box as idle', () => {
+  const pane = `
+• Working (...)
+
+┌─────────────────────────────────────────────────────────────┐
+│ > Type your message...                                      │
+└─────────────────────────────────────────────────────────────┘`;
+  assert.equal(overlay.paneTextActivityState(pane), 'idle');
+});
+
+test('agent activity state treats stale tool box plus input prompt as idle', () => {
   const pane = `
  ┌─── ⏳ Bash ─────────────────────────────────────────────────┐
- │ $ long running benchmark                                    │
+ │ $ completed benchmark                                      │
  └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
 │ > Type your message...                                      │
 └─────────────────────────────────────────────────────────────┘`;
+  assert.equal(overlay.paneTextActivityState(pane), 'idle');
+});
+
+test('agent activity state treats tool box without input prompt as busy', () => {
+  const pane = `
+ ┌─── ⏳ Bash ─────────────────────────────────────────────────┐
+ │ $ long running benchmark                                    │
+ └─────────────────────────────────────────────────────────────┘`;
   assert.equal(overlay.paneTextActivityState(pane), 'busy');
 });
 
@@ -197,6 +238,15 @@ test('agent activity state ignores stale timed-out command transcript', () => {
 test('hidden live agent process keeps unknown screen busy', () => {
   assert.equal(overlay.activityStateFromSignals('unknown', true), 'busy');
   assert.equal(overlay.activityStateFromSignals('unknown', false), 'unknown');
+});
+
+test('watcher demotes running to done immediately when input prompt is visible', () => {
+  assert.equal(overlay.watcherStatusAfterTick('running', false, true, 1, 4), 'done');
+});
+
+test('watcher keeps running during non-prompt quiet hysteresis', () => {
+  assert.equal(overlay.watcherStatusAfterTick('running', false, false, 3, 4), 'running');
+  assert.equal(overlay.watcherStatusAfterTick('running', false, false, 4, 4), 'done');
 });
 
 test('visible idle prompt overrides live agent process', () => {
